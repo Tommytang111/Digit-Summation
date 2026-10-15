@@ -1,0 +1,39 @@
+# Tiny configuration for wiring checks and fast end-to-end smoke runs (minutes, not hours).
+# Results from this config say nothing about convergence or final accuracy.
+name: debug
+
+data:
+  manifest_dir: data/manifests/debug
+  # 5% stratified subsets of each source pool: ~2.5k train, 500 val, 500 test images.
+  train_source_fraction: 0.05
+  val_source_fraction: 0.05
+  test_source_fraction: 0.05
+  num_train_sequences: 2000
+  num_val_sequences: 500
+  num_test_sequences: 500
+  num_diagnostic_sequences: 200
+
+augment:
+  mode: affine
+
+train:
+  device: auto          # train_local.py: MPS if available, else CPU
+  batch_size: 64
+  epochs: 2
+  max_steps: 60         # hard cap on optimizer updates
+  eval_every_steps: 20
+  log_every_steps: 10
+  num_workers: 0
+
+logging:
+  wandb_mode: disabled
+
+overfit:
+  num_examples: 64
+  max_steps: 300        # initial cap for the tiny-overfit check
+  lr: 1.0e-3
+  batch_size: 64
+
+eval:
+  batch_size: 256
+  num_stress_image_sequences: 20

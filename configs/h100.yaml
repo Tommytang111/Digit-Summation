@@ -1,0 +1,48 @@
+# Single-GPU CUDA run (train_cloud.py). Data and optimization settings mirror configs/local.yaml
+# exactly (same manifest_dir, batch size, LR, epochs, float32), so an MPS-vs-H100 comparison
+# differs only in hardware, data-loader workers, and kernel numerics.
+#
+# Optional, *disclosed* deviations (each changes the experiment, so name the run accordingly):
+#   --set train.amp_dtype=bf16                      bfloat16 autocast (checked for support)
+#   --set train.allow_tf32=true                     TF32 float32 matmuls
+#   --set train.batch_size=256 train.lr=6.0e-4      larger batch: fewer optimizer steps per epoch
+name: h100
+
+data:
+  manifest_dir: data/manifests/main   # copy the frozen manifests from the Mac; do not regenerate
+  train_source_fraction: 1.0
+  val_source_fraction: 1.0
+  test_source_fraction: 1.0
+  num_train_sequences: 20000
+  num_val_sequences: 2000
+  num_test_sequences: 5000
+  num_diagnostic_sequences: 1000
+
+augment:
+  mode: affine
+
+train:
+  device: cuda
+  seed: 0
+  batch_size: 64
+  grad_accum_steps: 1
+  epochs: 40
+  max_steps: null
+  eval_every_steps: 250
+  log_every_steps: 50
+  lr: 3.0e-4
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  lr_schedule: constant
+  num_workers: 8        # Albumentations runs on CPU workers; the tiny model is input-bound
+  pin_memory: true
+  amp_dtype: none
+  allow_tf32: false
+
+logging:
+  wandb_mode: offline
+  wandb_project: digit-summation
+
+eval:
+  batch_size: 512
+  num_stress_image_sequences: 50

@@ -1,0 +1,15 @@
+# Generated data (MNIST download, source pools, manifests) - rebuild with prepare_data.py
+data/
+# Run outputs: metrics, plots, checkpoints, W&B offline runs
+runs/
+wandb/
+*.pt
+*.tmp
+
+# Secrets: never commit real credentials (.env.example holds placeholders only)
+.env
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store

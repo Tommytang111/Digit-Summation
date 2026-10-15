@@ -1,0 +1,18 @@
+# Tested versions (macOS 26.5, Apple M4 Pro, Python 3.12.15). Install PyTorch FIRST, per platform:
+#
+#   macOS (Apple silicon, MPS):     pip install torch==2.14.1 torchvision==0.29.1
+#   Linux + NVIDIA (default wheel bundles CUDA 13.0; needs a driver that supports CUDA 13):
+#                                   pip install torch==2.14.1 torchvision==0.29.1
+#   Linux + older NVIDIA driver:    pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu126
+#
+# Then: pip install -r requirements.txt
+numpy==2.5.4
+matplotlib==3.11.2
+# The original MIT-licensed `albumentations` package, as requested (upstream is archived; its
+# successor AlbumentationsX is AGPL-3.0/commercial and is deliberately NOT used here).
+albumentations==2.0.8
+albucore==0.0.24
+opencv-python-headless==5.0.0.93
+PyYAML==6.0.3
+wandb==0.30.0
+pytest==9.1.1

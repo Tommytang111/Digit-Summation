@@ -1,0 +1,41 @@
+# Full main-task experiment on the M4 Pro (MPS, float32). Start it explicitly; nothing runs it
+# automatically. The sequence budgets are starting points, not known-sufficient sizes.
+name: local
+
+data:
+  manifest_dir: data/manifests/main
+  train_source_fraction: 1.0
+  val_source_fraction: 1.0
+  test_source_fraction: 1.0
+  num_train_sequences: 20000
+  num_val_sequences: 2000
+  num_test_sequences: 5000
+  num_diagnostic_sequences: 1000
+
+augment:
+  mode: affine          # compare against none / affine_elastic with --set augment.mode=...
+
+train:
+  device: auto
+  seed: 0
+  batch_size: 64        # 312 optimizer steps per epoch (20000 // 64)
+  grad_accum_steps: 1
+  epochs: 40            # ~12.5k optimizer steps
+  max_steps: null
+  eval_every_steps: 250
+  log_every_steps: 50
+  lr: 3.0e-4
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  lr_schedule: constant
+  num_workers: 0        # simplest Mac debugging; try 2-4 later if data loading dominates
+  pin_memory: false
+  amp_dtype: none       # float32 on MPS
+
+logging:
+  wandb_mode: offline   # no network needed; `wandb sync` later, or --set logging.wandb_mode=online
+  wandb_project: digit-summation
+
+eval:
+  batch_size: 256
+  num_stress_image_sequences: 50
