@@ -60,17 +60,63 @@ def test_elastic_displacement_scales_with_alpha():
     assert large["rms_per_axis_px"] / small["rms_per_axis_px"] == pytest.approx(2.0, rel=0.2)
 
 
-def test_dataloader_workers_get_distinct_augmentation_streams():
-    """Without worker reseeding every worker would replay the same 'random' transforms."""
-    from engine import make_loader
-    from config import TrainConfig
+def test_children_share_one_stream_instead_of_identical_copies():
+    """Compose.set_random_seed seeds every child identically; seed_compose shares one stream."""
+    transform = build_transform(AugmentConfig(mode="affine_elastic"), train=True, seed=3)
+    affine, elastic = transform.compose.transforms[0], transform.compose.transforms[1]
+    assert affine.random_generator is elastic.random_generator and affine.py_random is elastic.py_random
+    import albumentations as A
 
-    images = np.stack([DIGIT] * 4)
+    naive = A.Compose([A.Affine(p=1.0), A.ElasticTransform(p=1.0)], seed=3)
+    first, second = naive.transforms
+    assert first.random_generator.random() == second.random_generator.random()  # the duplication avoided
+
+
+def _row_dataset(rows=24, length=3, mode="affine_elastic"):
+    images = np.random.default_rng(1).integers(0, 256, size=(5, 28, 28), dtype=np.uint8)
     manifest = SequenceManifest(
-        "w", "train", np.zeros((8, 1), np.uint8), np.ones((8, 1), bool), np.zeros((8, 1), np.int32), np.zeros(8, np.int16)
+        "rows",
+        "train",
+        np.zeros((rows, length), np.uint8),
+        np.ones((rows, length), bool),
+        np.random.default_rng(2).integers(0, 5, size=(rows, length)).astype(np.int32),
+        np.zeros(rows, np.int16),
     )
-    dataset = DigitSumDataset(manifest, images, build_transform(AugmentConfig(mode="affine"), train=True, seed=1))
-    loader = make_loader(dataset, 1, torch.device("cpu"), TrainConfig(num_workers=2), seed=0)
-    first_items = [batch["images"][0, 0, 0] for batch in loader]
-    # DataLoader interleaves workers: items 0 and 1 are the first draws of workers 0 and 1.
-    assert not torch.equal(first_items[0], first_items[1])
+    return DigitSumDataset(manifest, images, build_transform(AugmentConfig(mode=mode, elastic_p=1.0), train=True), augment_seed=11)
+
+
+def test_row_augmentation_is_a_pure_function_of_seed_epoch_row():
+    dataset = _row_dataset()
+    reference = dataset[(5, 0)]["images"]
+    dataset[(7, 0)], dataset[(5, 3)]  # other accesses in between must not matter
+    assert torch.equal(dataset[(5, 0)]["images"], reference)
+    assert not torch.equal(dataset[(5, 1)]["images"], reference)  # new epoch -> new augmentation
+    first_slot = dataset[(5, 0)]["images"][0]
+    other_row = _row_dataset()
+    other_row.manifest.source_index[6] = other_row.manifest.source_index[5]
+    assert not torch.equal(other_row[(6, 0)]["images"][0], first_slot)  # same pixels, other row -> other draw
+
+
+def test_batches_identical_for_any_num_workers_and_persistence():
+    """The property that makes a num_workers speed comparison controlled: same data, every epoch."""
+    from config import TrainConfig
+    from engine import EpochShuffleSampler, make_loader
+
+    def epochs_of_batches(num_workers, persistent):
+        dataset = _row_dataset()
+        sampler = EpochShuffleSampler(len(dataset), seed=4)
+        cfg = TrainConfig(num_workers=num_workers, persistent_workers=persistent)
+        loader = make_loader(dataset, 4, torch.device("cpu"), cfg, sampler=sampler, drop_last=True)
+        out = []
+        for epoch in range(2):
+            sampler.set_epoch(epoch)
+            out.append([(batch["indices"].clone(), batch["images"].clone()) for batch in loader])
+        return out
+
+    reference = epochs_of_batches(0, False)
+    assert not torch.equal(reference[0][0][1], reference[1][0][1])  # epochs differ
+    for num_workers, persistent in ((2, False), (2, True)):
+        other = epochs_of_batches(num_workers, persistent)
+        for ref_epoch, other_epoch in zip(reference, other):
+            for (ref_idx, ref_img), (idx, img) in zip(ref_epoch, other_epoch):
+                assert torch.equal(ref_idx, idx) and torch.equal(ref_img, img), (num_workers, persistent)

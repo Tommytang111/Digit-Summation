@@ -31,7 +31,7 @@ import numpy as np
 import visualization as viz
 from augmentations import build_transform
 from dataset import SequenceManifest, compute_targets, load_prepared_data
-from engine import EvalOutput, evaluate, load_model_from_checkpoint, make_loader, resolve_device
+from engine import EvalOutput, evaluate, load_model_from_checkpoint, macro_f1, make_loader, resolve_device
 from tokenizer import class_id_to_text, number_to_string
 
 
@@ -140,6 +140,7 @@ def main() -> int:
         "answer": class_id_to_text(majority),
         "accuracy": float((main_result.targets == majority).mean()),
         "mae": float(np.abs(main_result.targets - majority).mean()),
+        "macro_f1": macro_f1(np.full_like(main_result.targets, majority), main_result.targets, cfg.num_classes),
     }
 
     # Diagnostics (each its own population; not mixed into the headline).
@@ -214,16 +215,16 @@ def main() -> int:
     viz.plot_sequence_gallery(stress_rows, out / "stress.png", "Stress cases (constructed; not part of the natural results)")
 
     print(f"\n== {args.split} (naturally sampled) ==")
-    print(f"exact-sum accuracy {main_result.accuracy:.4f}  MAE {main_result.mae:.3f}  loss {main_result.loss:.4f}  n={main_result.num_examples}")
-    print(f"majority baseline ({baseline['answer']}): accuracy {baseline['accuracy']:.4f}  MAE {baseline['mae']:.3f}")
+    print(f"exact-sum accuracy {main_result.accuracy:.4f}  macro-F1 {main_result.macro_f1:.4f}  MAE {main_result.mae:.3f}  loss {main_result.loss:.4f}  n={main_result.num_examples}")
+    print(f"majority baseline ({baseline['answer']}): accuracy {baseline['accuracy']:.4f}  macro-F1 {baseline['macro_f1']:.4f}  MAE {baseline['mae']:.3f}")
     print("by image count: " + ", ".join(f"{r['group']}:{r['accuracy']:.2f}(n={r['n']})" for r in by_images if r["n"]))
     print("by sum range:   " + ", ".join(f"{r['group']}:{r['accuracy']:.2f}(n={r['n']})" for r in by_range if r["n"]))
     print("\n== diagnostics (separate populations) ==")
-    print(f"text-only set  acc {text_only.accuracy:.4f} (n={text_only.num_examples})")
-    print(f"all-image set  acc {all_image.accuracy:.4f} (n={all_image.num_examples})")
+    print(f"text-only set  acc {text_only.accuracy:.4f}  macro-F1 {text_only.macro_f1:.4f} (n={text_only.num_examples})")
+    print(f"all-image set  acc {all_image.accuracy:.4f}  macro-F1 {all_image.macro_f1:.4f} (n={all_image.num_examples})")
     p = diagnostics["permutation_test"]
     print(f"permutation    acc {p['accuracy']:.4f}; agreement {p['prediction_agreement_with_original_order']:.4f}; max |dlogit| {p['max_abs_logit_difference']:.2e}")
-    print(f"ORACLE text substitution acc {oracle.accuracy:.4f} (uses true labels; changes modality mix)")
+    print(f"ORACLE text substitution acc {oracle.accuracy:.4f}  macro-F1 {oracle.macro_f1:.4f} (uses true labels; changes modality mix)")
     print("\n== stress cases (constructed) ==")
     for name, s in stress.items():
         print(f"{name:>14}: target {s['target']:>2}  acc {s['accuracy']:.2f}  (n={s['n']}, predictions {s['predictions_seen']})")

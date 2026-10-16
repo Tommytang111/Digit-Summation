@@ -28,6 +28,7 @@ from augmentations import (
     NORMALIZED_WHITE,
     build_transform,
     geometric_transforms,
+    seed_compose,
     measure_elastic_displacement,
 )
 from config import load_config
@@ -152,7 +153,8 @@ def main() -> None:
     examples_per_digit = [pool[train_labels[pool] == d][preview_rng.integers(0, (train_labels[pool] == d).sum())] for d in range(10)]
     columns = {"raw": [[train_images[i]] for i in examples_per_digit]}
     for mode in ("affine", "affine_elastic"):
-        pipeline = A.Compose(geometric_transforms(cfg.augment, mode), seed=7)  # uint8 ops only, no Normalize
+        pipeline = A.Compose(geometric_transforms(cfg.augment, mode))  # uint8 ops only, no Normalize
+        seed_compose(pipeline, 7)  # one shared stream, so Affine and Elastic do not replay the same draws
         columns[mode] = [[pipeline(image=train_images[i])["image"] for _ in range(5)] for i in examples_per_digit]
     viz.plot_augmentation_preview(
         columns,

@@ -113,7 +113,7 @@ Digit-Summation/
 ├── train_cloud.py         thin single-GPU CUDA entry point
 ├── evaluate.py            explicit checkpoint evaluation (val or test) + diagnostics + galleries
 ├── compare_runs.py        tabulates runs; verifies they share pools and eval manifests
-├── tests/                 70 focused tests on synthetic fixtures (no download needed)
+├── tests/                 85 focused tests on synthetic fixtures (no download needed)
 ├── requirements.txt       non-torch dependencies pinned to tested versions
 ├── pytest.ini, .gitignore, .env.example (placeholders only)
 ├── data/                  (gitignored) MNIST download + data/manifests/{debug,main}/
@@ -291,8 +291,8 @@ accident.
 
 ```
 images [B,10,1,28,28] ─ select real image slots ─▶ [N_img,1,28,28]
-   └─ ImageEncoder: conv3x3(1→32)·GELU·maxpool ─▶ [N_img,32,14,14]
-                    conv3x3(32→64)·GELU·maxpool ─▶ [N_img,64,7,7] ─ flatten ─▶ [N_img,3136]
+   └─ ImageEncoder: conv3x3(1→32)·BatchNorm·ReLU·maxpool2 ─▶ [N_img,32,14,14]
+                    conv3x3(32→64)·BatchNorm·ReLU·maxpool2 ─▶ [N_img,64,7,7] ─ flatten ─▶ [N_img,3136]
                     Linear ─▶ [N_img,128] ─ LayerNorm ─▶ scatter back into [B,10,128]
 token_ids [B,10] ─ nn.Embedding(11,128,padding_idx=0) ─▶ [B,10,128]
 torch.where(is_image, image_features, text_features) ─▶ [B,10,128]
@@ -303,8 +303,9 @@ final LayerNorm ─▶ masked sum over the 10 operands ─▶ [B,128] ─ Linear
 answer text = str(argmax(logits))
 ```
 
-Parameters: **830,811** (image encoder 420,608; encoder layers 396,544; head 11,739; token
-embedding 1,408; modality embedding 256; final norm 256). `python sanity_checks.py shapes`
+Parameters: **830,907** (image encoder 420,704; encoder layers 396,544; head 11,739; token
+embedding 1,408; modality embedding 256; final norm 256). The original GELU encoder without
+BatchNorm had 830,811. `python sanity_checks.py shapes`
 prints every shape transition and confirms that the step-by-step result equals `forward`.
 
 Design choices, and why:
@@ -338,6 +339,21 @@ Design choices, and why:
 - **Modality embedding (optional, on by default).** A learned vector per modality tags which
   encoder produced each slot, so attention can treat CNN features and token embeddings
   differently. Disable it with `--set model.use_modality_embedding=false` to ablate.
+- **CNN encoder: ReLU + max pooling + BatchNorm (the defaults).**
+  - Set by `model.cnn_activation` (`relu`/`gelu`), `model.cnn_pooling` (`max`/`avg`), and
+    `model.cnn_batch_norm`. BatchNorm follows each conv, and the conv bias is dropped because
+    BatchNorm's shift replaces it.
+  - **Why these defaults:** chosen from a 3-seed standalone digit benchmark in
+    `CNN-encoder-test/`. Validation digit accuracy was 0.9924 ± 0.0002 for this encoder vs
+    0.9915 ± 0.0005 for the original GELU + avg-pool encoder without BatchNorm. The implied
+    validation sum ceiling was 0.9629 vs 0.9588.
+  - **Not yet measured:** a sum-model run with this encoder.
+  - **BatchNorm and placeholders:** the CNN only sees gathered real image slots, so text
+    placeholders never enter its batch statistics (tested). In eval mode it uses running
+    averages, so evaluation stays permutation-invariant.
+  - **Older checkpoints:** a checkpoint from before these options rebuilds as what it was.
+    `engine.load_checkpoint` fills in GELU without BatchNorm, and max pooling if pooling is
+    unrecorded. Your earlier runs (e.g. `full-s0`: GELU / avg / no BN) still evaluate correctly.
 - **Gather/scatter for images.** The CNN runs only on real image slots, never on placeholders,
   and is skipped entirely for all-text batches. Tests check that gradients reach the CNN only when
   images are present and reach digit-token embeddings only when text is present.
@@ -390,15 +406,30 @@ different strength under that setting.
   in this session, so check §2 of the paper. This project **does not reproduce** their setup: the
   library and parameter conventions differ, and no comparison was run.
 
-**Seeding.**
-- Albumentations' `Compose(seed=...)` owns its RNG, so `np.random.seed` does **not** affect it.
-  Training reseeds the transform once per epoch (`num_workers = 0`), or once per worker per epoch
-  through `augmentations.seed_worker` (`num_workers > 0`).
-- It is never reseeded per sample: that would give every image the identical "random" transform.
-- **Measured:** without `seed_worker`, two DataLoader workers produced *identical* augmentation
-  streams under albumentations 2.0.8. A test now guards this.
-- **Limits:** augmentation streams differ between `num_workers` settings. Mid-epoch resume does
-  not replay the exact augmentations. MPS/CUDA kernels may be nondeterministic.
+**Seeding: augmentation is a pure function of (seed, epoch, row).**
+- Albumentations' Compose owns its RNG, so `np.random.seed` does **not** affect it.
+- The training sampler yields `(row, epoch)` pairs. Before transforming a row's images,
+  `DigitSumDataset` reseeds the transform with `derive_seed(augment_seed, epoch, row)`.
+- **Consequence:** `num_workers`, `persistent_workers`, batch size, and resume do not change which
+  augmentation a row gets. Runs that differ only in loader settings see **identical training
+  data**, which makes loader speed comparisons controlled.
+- This is not the classic "reseed per sample" bug, which reseeds with *one constant* and gives
+  every image the same transform. Here every (epoch, row) has its own seed.
+- **Verified:** a test checks that 0 workers, 2 workers, and 2 persistent workers produce
+  bit-identical batches over two epochs. Two 40-update debug trainings, with 0 and with 2
+  persistent workers, logged identical training losses at every step.
+- **Cost:** reseeding adds ~28 µs per sequence (`affine`, ~11%) or ~20 µs (`affine_elastic`,
+  ~5%), measured on the full data.
+- **Shared generator.** albumentations' own `Compose.set_random_seed(s)` gives *every child* an
+  identically seeded generator, so `Affine` and `ElasticTransform` would replay the same random
+  numbers. Under per-row reseeding that would become a systematic correlation. `seed_compose`
+  instead gives Compose and all children one shared generator pair, and a test checks this.
+- `seed_worker` still reseeds each worker's global RNGs and transform. That matters only for
+  dataset accesses that carry no epoch, because without it every worker replays the same stream
+  (measured under albumentations 2.0.8).
+- **Limit:** GPU float arithmetic is not bit-reproducible. Two runs with an *identical* config and
+  0 workers ended 40 updates with weights differing by up to 3.5e-7, the same size as a 0- vs
+  2-worker pair (2.5e-7). Validation loss can differ in the last float32 digit (2.4e-7).
 
 ### 5. Training
 
@@ -419,6 +450,20 @@ Settings:
 - **Validation and selection:** validation runs every `eval_every_steps` and at the end.
   **`best.pt` is selected by validation accuracy** (ties broken by validation loss), and
   `last.pt` is saved at every evaluation. The test split is never touched during training.
+- **Early stopping (optional), on validation accuracy:**
+  - `train.early_stopping_patience: N` ends training after N validations in a row without a
+    new highest validation accuracy. A gain of `early_stopping_min_delta` or less (in accuracy
+    units, e.g. 0.001 = 0.1 points) doesn't count. `null` (the default) turns it off;
+    `local.yaml` and `h100.yaml` set 15.
+  - Patience is counted in validations, so 15 × `eval_every_steps: 1000` = 15,000 updates.
+  - The counter is saved in checkpoints. A resumed run continues the count, and a run that
+    already stopped stays stopped unless you raise the patience. `summary.json` records
+    `stopped_early` and `planned_optimizer_steps`.
+  - Accuracy is used rather than loss because, on `full-s0`, validation loss reached its minimum
+    (0.618) at step 29k while accuracy kept improving (0.929 at 29k, 0.945 at 47k). A loss-based
+    patience of 10 would have stopped at 39k. Replayed over `full-s0`'s first 55 validations,
+    the accuracy rule with patience 15 never triggers.
+  - With `warmup_cosine`, an early stop also skips the low-learning-rate end of the schedule.
 
 **Checkpoints** (`runs/<run>/checkpoints/{best,last}.pt`) contain:
 - model, optimizer, and scheduler state; the scaler slot is `None`, since float32 and bf16 need no
@@ -433,9 +478,9 @@ They load with `torch.load(weights_only=True)`, the safe unpickler, and always o
 so a checkpoint saved on MPS loads on CUDA or CPU. This is tested.
 
 **Resume:** `train_local.py --resume runs/<run>/checkpoints/last.pt [--set train.max_steps=N]`.
-- **Exact at epoch boundaries:** data order, model, optimizer, scheduler, and RNG states.
-- **Mid-epoch:** the run skips the batches already consumed, in the same order, but the
-  augmentation draws for the remaining batches differ from an uninterrupted run.
+- **Restored:** data order, per-row augmentation, model, optimizer, scheduler, and RNG states.
+- **Mid-epoch:** the run skips the batches already consumed. The remaining rows get exactly the
+  augmentations an uninterrupted run would have used, up to GPU float nondeterminism.
 - Local metrics continue in the same run directory. A W&B run on resume starts a new W&B run.
 
 **Devices.**
@@ -450,6 +495,13 @@ so a checkpoint saved on MPS loads on CUDA or CPU. This is tested.
   No DDP, FlashAttention, or `torch.compile`.
 - **Throughput** is timed after `torch.mps.synchronize()` / `torch.cuda.synchronize()`, measured
   end to end including data loading, and validation time is excluded.
+- **Data-loader workers.**
+  - `train.num_workers` sets how many processes build batches in parallel. With
+    `train.persistent_workers: true`, they stay alive across epochs and validation passes, so
+    they don't restart and re-import every time.
+  - Neither setting changes the data (see Seeding).
+  - `local.yaml` uses 4 persistent workers; `debug.yaml` uses 0, which is easiest to debug.
+  - The validation loader shares these settings.
 
 ### 6. Evaluation
 
@@ -459,14 +511,32 @@ populations **separate**:
 
 | section | what it is |
 |---|---|
-| **main** | the naturally sampled split: exact-sum accuracy, MAE, loss, n; accuracy by number of image operands (0–10) and by sum range (0–9 … 80–90), each with n |
-| **majority baseline** | always answer the most frequent training sum (45 for the main data: **3.84%** test accuracy) |
+| **main** | the naturally sampled split: exact-sum accuracy, macro F1, MAE, loss, n; accuracy by number of image operands (0–10) and by sum range (0–9 … 80–90), each with n |
+| **majority baseline** | always answer the most frequent training sum (45 for the main data: **3.84%** test accuracy); its accuracy, macro F1, and MAE are reported |
 | text-only set | 1,000 all-text sequences (no handwriting needed) |
 | all-image set | 1,000 all-image sequences from the same split's pool |
 | permutation test | operands shuffled per row; agreement with the original predictions + max logit difference |
 | **ORACLE substitution** | every image replaced by its *true* digit token. This uses ground-truth labels, so it is a diagnostic upper reference, **not** a result. It also changes the modality mix: every row becomes all-text, which is rare (0.1%) in training. |
 | sums unseen in training | count and accuracy of eval rows whose sum never occurs in the training manifest (2 rows in the main test set) |
 | **stress cases** | constructed all-0 / all-9 rows (text, image, mixed). Sums 0 and 90 essentially never occur in training (p = 1e-10), so failures here are expected and reported apart from natural results |
+
+**Macro F1** treats each sum class equally, unlike accuracy:
+- For each class c, F1_c = 2·TP_c / (#predicted c + #true c). Equivalently, it is the harmonic
+  mean of precision and recall for "the sum is c".
+- Macro F1 is the plain mean over the classes that appear in the targets **or** the predictions,
+  which is sklearn's `average="macro"` convention (a test checks the match).
+  - A class that is only predicted, or never predicted, scores 0.
+  - Classes absent from both are skipped.
+- **How to read it next to accuracy:**
+  - Accuracy is dominated by the common sums near 45. Macro F1 gives a rare sum like 12 (a
+    handful of validation rows) the same weight as 45, so it is sensitive to the tails and
+    noisier.
+  - Classes that never occur in training (0–10, 77–90 for the main data) can only score 0 when
+    they appear in an evaluation set.
+  - Always guessing 45 scores almost nothing: one class with a small F1, averaged with zeros.
+- Checkpoint selection still uses validation **accuracy**; macro F1 is reported alongside it.
+- Diagnostic sets (text-only, all-image, permutation, oracle) report macro F1 too, each over its
+  own population.
 
 Galleries are **reproducibly sampled** (fixed seeds). `examples.png` shows a random draw that
 includes successes and failures alike, and `failures.png` shows a random draw from the errors
@@ -479,10 +549,14 @@ Every run always writes local, machine-readable records, so no network or creden
 - `runs/<run>/config.json` holds the resolved config, seeds, device, parameter counts,
   source/sequence counts, and data IDs.
 - `runs/<run>/metrics.jsonl` has one JSON object per event, each with `optimizer_step`.
-  - Training: `train/loss`, `train/accuracy`, `train/lr`, `train/samples_per_sec`,
-    `train/grad_norm_preclip`.
-  - Validation: `val/loss`, `val/accuracy`, `val/mae`.
-- `runs/<run>/loss_curves.png` plots training and validation loss and accuracy **against
+  - Training: `train/loss`, `train/accuracy`, `train/macro_f1`, `train/lr`,
+    `train/samples_per_sec`, `train/grad_norm_preclip`. These are averaged over the sequences of
+    each logging interval. `train/macro_f1` uses per-class counts accumulated on the device over
+    that interval.
+  - Validation: `val/loss`, `val/accuracy`, `val/macro_f1`, `val/mae`, each over the full
+    validation set.
+  - `summary.json` adds `best_val_macro_f1`, the macro F1 of the accuracy-selected checkpoint.
+- `runs/<run>/loss_curves.png` plots training and validation loss, accuracy, and macro F1 **against
   optimizer steps**. Training points are interval means in train mode (dropout and augmentation
   on); validation points are full eval-mode passes.
 - `train_examples.png` (what the model sees) and `val_predictions_best.png`.
@@ -532,18 +606,38 @@ $PY train_local.py  --config configs/local.yaml --set data.train_source_fraction
 
 # Ablations
 $PY train_local.py --config configs/local.yaml --set model.use_modality_embedding=false --set logging.run_name=local-nomod
+
+# Loader speed: only num_workers / persistent_workers change, so the training data is identical.
+# A capped max_steps keeps each run short. Don't run other GPU jobs at the same time.
+for w in 0 2 4 6 8; do
+  p=$([ $w -gt 0 ] && echo true || echo false)
+  $PY train_local.py --config configs/local.yaml --set train.max_steps=2000 \
+      --set train.num_workers=$w --set train.persistent_workers=$p \
+      --set logging.wandb_mode=disabled --set logging.run_name=speed-w$w
+done
+$PY compare_runs.py runs/speed-w*    # seq/s + train time per run; lists every differing setting
 ```
+
+`compare_runs.py` prints:
+- **seq/s**: the median end-to-end training throughput. Validation passes and the first slow
+  interval don't skew it.
+- **train time**: total wall time, including worker startup and validation passes.
+- **Config settings that differ**, which should be only `train.num_workers` and
+  `train.persistent_workers`.
+
+To isolate the cost of starting workers, also run `w=4` with `persistent_workers=false`.
 
 **Running on an H100.** Copy the project *with its frozen manifests* (`data/manifests/`) and
 install torch for CUDA (see Setup). Then run `prepare_data.py --config configs/h100.yaml`: it
 downloads MNIST and **verifies** the manifests regenerate identically (it already prints
 "verified" on the Mac). Then run `train_cloud.py --config configs/h100.yaml`.
 
-`h100.yaml` matches `local.yaml` in data, model, seed, batch 64, lr, epochs, and float32; a test
-enforces this. The only intended differences are hardware, `num_workers = 8`, pinned memory, and
-kernel numerics, which makes the device comparison controlled. Changing the batch size, using
-bf16, or enabling TF32 changes the experiment, so name such runs accordingly
-(e.g. `h100-bf16-s0`). Nothing in this repo provisions cloud resources.
+`h100.yaml` and `local.yaml` are independent files, and nothing checks that they stay in sync. For
+an MPS-vs-H100 comparison to be controlled, give both the same data, model, seed, batch size, lr,
+epochs and precision. Worker count and pinned memory can differ. Any other difference (batch
+size, bf16, TF32, epochs) changes the experiment, so name such runs accordingly
+(e.g. `h100-bf16-s0`). `compare_runs.py` still checks that compared runs used the same data.
+Nothing in this repo provisions cloud resources.
 
 ---
 
@@ -554,7 +648,7 @@ All of the following ran in this session on the M4 Pro (MPS), with no full train
 | check | outcome |
 |---|---|
 | `sanity_checks.py env` | all versions found. Op probe (forward + backward + AdamW on mixed / all-text / all-image / padded batches) **OK on CPU and MPS**. `PYTORCH_ENABLE_MPS_FALLBACK` not set |
-| `pytest` | **70 passed** in ~15 s: tokenizer, config, pools/dedup/fractions, manifests/targets, cross-split resampling, dataset/collate contract, audit (passes on clean data, catches injected leaks), augmentation (normalize once, black fill, seeding, worker streams), model (shapes, masks/padding, all-image/all-text, gradient branches, permutation invariance, bidirectionality, independent layers, CPU vs MPS), engine (checkpoint round trip, MPS load, RNG, sampler, weight-decay groups, accumulation step counting, resume) |
+| `pytest` | **82 passed** in ~46 s (the DataLoader-worker test starts real worker processes): tokenizer, config, pools/dedup/fractions, manifests/targets, cross-split resampling, dataset/collate contract, audit (passes on clean data, catches injected leaks), augmentation (normalize once, black fill, per-(epoch, row) seeding, shared child generator, identical batches for 0/2/2-persistent workers), model (shapes, masks/padding, all-image/all-text, gradient branches, permutation invariance, bidirectionality, independent layers, CPU vs MPS), engine (macro F1 vs sklearn + hand cases + device-side counts on CPU/MPS, checkpoint round trip, MPS load, RNG, sampler, weight-decay groups, accumulation step counting, resume, early stopping on val accuracy incl. resume, tolerant checkpoint-state loading) |
 | `prepare_data.py` (debug + main) | **audit 76/76 passed**. No exact duplicates in MNIST; pools are 50,000 / 10,000 / 10,000 (debug: 2,500 / 500 / 501). A re-run verified identical data, and a changed config was refused |
 | `inspect_data.py` (debug + main) | figures written. Normalization, pixel ranges, tokenization trace, and distributions as reported above |
 | `sanity_checks.py shapes` | every boundary as in the diagram. Step-by-step == forward. Layers independent |
@@ -565,6 +659,7 @@ All of the following ran in this session on the M4 Pro (MPS), with no full train
 | `train_local.py` debug, 60 updates | pipeline OK (checkpoints, curves, galleries, summary). It found and fixed one bug: `torch.__version__` in checkpoints broke `weights_only` loading. Two identical runs logged identical losses. Throughput ≈ 1,800 seq/s end to end |
 | `evaluate.py --split val` on that debug checkpoint | all outputs written. Permutation agreement 1.0000, max logit difference 1.4e-6 |
 | resume from `last.pt` mid-epoch | continued at update 60 and stopped at the epoch cap (62) |
+| `num_workers` 0 vs 2 (persistent), 40 debug updates each | identical training losses at every logged step. Final weights differ by ≤ 2.5e-7, the same size as two runs of an identical 0-worker config (≤ 3.5e-7), i.e. GPU float nondeterminism, not data. The same checkpoint evaluated with 0 vs 2 workers gives bit-identical inputs, logits, and loss |
 | W&B **offline** debug run (20 updates) | offline run written, with the `wandb sync` command printed. No key fields in the local records |
 
 **The tiny-overfit successes show only that the wiring can memorize.** The debug run's numbers
@@ -593,7 +688,8 @@ it has not been measured.
 | `Manifest 'train' ... has N rows but the config asks for M` | the config and `manifest_dir` don't match; re-run `prepare_data.py` with the training config |
 | `An operation is not implemented on MPS` | run with `--device cpu`. Or set `PYTORCH_ENABLE_MPS_FALLBACK=1` knowingly: those ops then run silently on the CPU |
 | loud `PYTORCH_ENABLE_MPS_FALLBACK=1` warning | `unset PYTORCH_ENABLE_MPS_FALLBACK` |
-| slow data loading on the Mac | try `--set train.num_workers=2` (spawned workers copy the dataset; augmentation streams then differ from `num_workers=0`) |
+| slow data loading on the Mac | `--set train.num_workers=4 --set train.persistent_workers=true` (speed only; the data is identical for any value) |
+| a script hangs or fails with `FileNotFoundError: .../<stdin>` when using workers | macOS starts workers with "spawn", which re-imports the main script. Run code from a `.py` file with an `if __name__ == "__main__":` guard, not via `python -` / stdin |
 | `train_cloud.py`: `CUDA is not available` | check `nvidia-smi`, and that torch was installed from a CUDA wheel (`torch.version.cuda` not `None`) |
 | `bf16 ... not supported` | the GPU lacks bfloat16; keep `train.amp_dtype=none` |
 | W&B asks for login | `wandb login`, or use `--set logging.wandb_mode=offline` / `disabled` |
@@ -612,8 +708,9 @@ it has not been measured.
 - **Classification over 0–90 cannot extrapolate.** 24 of the 91 classes never occur in the
   training manifest, so the extremes (stress cases) are expected to fail.
 - **Validation is not writer-independent.** Near-duplicate images are not detected.
-- **Reproducibility** is exact only for a fixed device, `num_workers`, and library versions.
-  MPS/CUDA kernels may be nondeterministic, and mid-epoch resume changes augmentation draws.
+- **Reproducibility:** the training data stream (order + augmentation) is identical for any
+  `num_workers`, persistence, or batch size, and on resume. GPU arithmetic is not bit-identical
+  run to run: weights differ by ~1e-7 after 40 updates, even with an identical config.
 - **Elastic distortions** are calibrated by measured displacement but are not a reproduction of
   Simard et al.
 

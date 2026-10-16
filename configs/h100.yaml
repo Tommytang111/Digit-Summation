@@ -1,48 +1,61 @@
-# Single-GPU CUDA run (train_cloud.py). Data and optimization settings mirror configs/local.yaml
-# exactly (same manifest_dir, batch size, LR, epochs, float32), so an MPS-vs-H100 comparison
-# differs only in hardware, data-loader workers, and kernel numerics.
+# Single-GPU CUDA run (train_cloud.py). Mirrors configs/local.yaml: same data, augmentation, model,
+# optimization, early stopping, logging, and evaluation settings. The only differences are hardware
+# settings that change speed, not the training data:
+#   device: cuda, pin_memory: true, num_workers: 8 (augmentation is seeded per (epoch, row), so the
+#   data stream is identical for any worker count).
+# Nothing keeps the two files in sync automatically; edit both together. compare_runs.py lists
+# any setting that differs between two finished runs.
 #
-# Optional, *disclosed* deviations (each changes the experiment, so name the run accordingly):
-#   --set train.amp_dtype=bf16                      bfloat16 autocast (checked for support)
-#   --set train.allow_tf32=true                     TF32 float32 matmuls
-#   --set train.batch_size=256 train.lr=6.0e-4      larger batch: fewer optimizer steps per epoch
+# Optional deviations. Each changes the experiment, so name the run accordingly:
+#   --set train.amp_dtype=bf16      bfloat16 autocast (support is checked)
+#   --set train.allow_tf32=true     TF32 float32 matmuls
 name: h100
 
 data:
-  manifest_dir: data/manifests/main   # copy the frozen manifests from the Mac; do not regenerate
+  manifest_dir: data/manifests/full   # copy the frozen manifests from the Mac; prepare_data.py verifies them
   train_source_fraction: 1.0
   val_source_fraction: 1.0
   test_source_fraction: 1.0
-  num_train_sequences: 20000
-  num_val_sequences: 2000
-  num_test_sequences: 5000
+  num_train_sequences: 100000
+  num_val_sequences: 20000
+  num_test_sequences: 20000
   num_diagnostic_sequences: 1000
 
 augment:
   mode: affine
 
+model:
+  cnn_activation: relu    # relu | gelu (the original encoder used gelu)
+  cnn_pooling: max        # max | avg
+  cnn_batch_norm: true    # BatchNorm after each conv
+
 train:
   device: cuda
   seed: 0
-  batch_size: 64
+  batch_size: 256        # 100000 // 256 = 390 optimizer steps per epoch
   grad_accum_steps: 1
-  epochs: 40
+  epochs: 200            # 390 x 200 = 78,000 optimizer steps (early stopping may end sooner)
   max_steps: null
-  eval_every_steps: 250
+  eval_every_steps: 1000
   log_every_steps: 50
   lr: 3.0e-4
   weight_decay: 0.01
   grad_clip_norm: 1.0
-  lr_schedule: constant
-  num_workers: 8        # Albumentations runs on CPU workers; the tiny model is input-bound
-  pin_memory: true
-  amp_dtype: none
-  allow_tf32: false
+  lr_schedule: warmup_cosine
+  warmup_steps: 500
+  early_stopping_patience: 15   # stop after 15 validations in a row without a new highest val accuracy (null = off)
+  early_stopping_min_delta: 0.0 # how much higher the accuracy must be to count (e.g. 0.001 = 0.1 points)
+  num_workers: 8        # hardware: the H100 consumes batches faster than the M4 Pro; speed only
+  persistent_workers: true
+  pin_memory: true      # hardware: CUDA-only, faster host-to-GPU copies
+  amp_dtype: none       # float32, like local
+  allow_tf32: false     # CUDA-only; keep false to match local float32 numerics
 
 logging:
-  wandb_mode: offline
+  wandb_mode: online    # needs `wandb login` (or WANDB_API_KEY) on the H100 machine
   wandb_project: digit-summation
+  wandb_entity: neoscith-solo
 
 eval:
-  batch_size: 512
+  batch_size: 256
   num_stress_image_sequences: 50

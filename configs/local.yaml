@@ -3,38 +3,48 @@
 name: local
 
 data:
-  manifest_dir: data/manifests/main
+  manifest_dir: data/manifests/full
   train_source_fraction: 1.0
   val_source_fraction: 1.0
   test_source_fraction: 1.0
-  num_train_sequences: 20000
-  num_val_sequences: 2000
-  num_test_sequences: 5000
+  num_train_sequences: 100000
+  num_val_sequences: 20000
+  num_test_sequences: 20000
   num_diagnostic_sequences: 1000
 
 augment:
   mode: affine          # compare against none / affine_elastic with --set augment.mode=...
 
+model:
+  cnn_activation: relu    # relu | gelu (the original encoder used gelu)
+  cnn_pooling: max        # max | avg
+  cnn_batch_norm: true    # BatchNorm after each conv
+
 train:
   device: auto
   seed: 0
-  batch_size: 64        # 312 optimizer steps per epoch (20000 // 64)
+  batch_size: 256        # optimizer steps per epoch (train_sequences // batch_size)
   grad_accum_steps: 1
-  epochs: 40            # ~12.5k optimizer steps
+  epochs: 200            # ~30k optimizer steps, currently takes ~ 6 minutes per training run.
   max_steps: null
-  eval_every_steps: 250
+  eval_every_steps: 1000
   log_every_steps: 50
   lr: 3.0e-4
   weight_decay: 0.01
   grad_clip_norm: 1.0
-  lr_schedule: constant
-  num_workers: 0        # simplest Mac debugging; try 2-4 later if data loading dominates
+  lr_schedule: warmup_cosine
+  warmup_steps: 500
+  early_stopping_patience: 15   # stop after 15 validations in a row without a new highest val accuracy (null = off)
+  early_stopping_min_delta: 0.0 # how much higher the accuracy must be to count (e.g. 0.001 = 0.1 points)
+  num_workers: 4        # No more than 4 is necessary, currently GPU is bottleneck.
+  persistent_workers: true  # keep workers alive across epochs + validations (no restart cost)
   pin_memory: false
   amp_dtype: none       # float32 on MPS
 
 logging:
-  wandb_mode: offline   # no network needed; `wandb sync` later, or --set logging.wandb_mode=online
+  wandb_mode: online   # no network needed; `wandb sync` later, or --set logging.wandb_mode=online
   wandb_project: digit-summation
+  wandb_entity: neoscith-solo
 
 eval:
   batch_size: 256

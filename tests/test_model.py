@@ -115,6 +115,41 @@ def test_encoder_layers_are_independently_initialized():
     assert not torch.equal(first.self_attn.in_proj_weight, second.self_attn.in_proj_weight)
 
 
+@pytest.mark.parametrize("pooling, layer", [("avg", torch.nn.AvgPool2d), ("max", torch.nn.MaxPool2d)])
+def test_cnn_pooling_option(pooling, layer):
+    model = make_model(cnn_pooling=pooling).eval()
+    pools = [m for m in model.image_encoder.features if isinstance(m, (torch.nn.AvgPool2d, torch.nn.MaxPool2d))]
+    assert len(pools) == 2 and all(isinstance(m, layer) for m in pools)
+    assert model(**inputs_of(synthetic_batch(kind="all_image"))).shape == (4, 91)
+
+
+def test_default_encoder_is_relu_maxpool_batchnorm():
+    m = ExperimentConfig().model
+    assert (m.cnn_activation, m.cnn_pooling, m.cnn_batch_norm) == ("relu", "max", True)
+    layer_types = [type(layer).__name__ for layer in make_model().image_encoder.features]
+    assert layer_types == ["Conv2d", "BatchNorm2d", "ReLU", "MaxPool2d"] * 2
+
+
+def test_original_gelu_encoder_layout_is_unchanged():
+    """With BatchNorm off the layer order matches the original encoder, so old checkpoints load."""
+    model = make_model(cnn_activation="gelu", cnn_pooling="avg", cnn_batch_norm=False)
+    assert [type(layer).__name__ for layer in model.image_encoder.features] == ["Conv2d", "GELU", "AvgPool2d"] * 2
+    assert all(m.bias is not None for m in model.image_encoder.features if isinstance(m, torch.nn.Conv2d))
+
+
+def test_batchnorm_statistics_ignore_text_placeholders():
+    """Only real image slots reach the CNN, so placeholder zeros never enter BatchNorm statistics."""
+    model = make_model().train()
+    batch = synthetic_batch(batch_size=4, kind="mixed", seed=6)
+    before = model.image_encoder.features[1].running_mean.clone()
+    model(**inputs_of(batch))
+    images_only = batch["images"][batch["is_image"]]  # [N_img, 1, 28, 28]
+    reference = make_model().train()
+    reference.image_encoder(images_only)
+    assert not torch.equal(model.image_encoder.features[1].running_mean, before)
+    assert torch.allclose(model.image_encoder.features[1].running_mean, reference.image_encoder.features[1].running_mean)
+
+
 def test_modality_embedding_is_optional():
     model = make_model(use_modality_embedding=False).eval()
     assert model.modality_embedding is None

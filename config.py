@@ -85,6 +85,9 @@ class ModelConfig:
     dropout: float = 0.1
     conv1_channels: int = 32
     conv2_channels: int = 64
+    cnn_pooling: Literal["avg", "max"] = "max"  # 2x2 downsampling after each conv
+    cnn_activation: Literal["relu", "gelu"] = "relu"
+    cnn_batch_norm: bool = True  # BatchNorm after each conv (conv bias dropped)
     use_modality_embedding: bool = True
     norm_first: bool = True  # pre-LayerNorm Transformer blocks (+ final LayerNorm)
 
@@ -106,7 +109,16 @@ class TrainConfig:
     grad_clip_norm: Optional[float] = 1.0
     lr_schedule: Literal["constant", "warmup_cosine"] = "constant"
     warmup_steps: int = 0
+    # Early stopping: stop after this many consecutive validations without a new highest
+    # validation accuracy (higher by more than min_delta, in accuracy units, e.g. 0.001 = 0.1
+    # points). null disables it. The count is in validations, so patience 15 with
+    # eval_every_steps 1000 means 15,000 updates without improvement.
+    early_stopping_patience: Optional[int] = None
+    early_stopping_min_delta: float = 0.0
     num_workers: int = 0
+    # Keep DataLoader worker processes alive across epochs/validations (num_workers > 0 only).
+    # Affects speed only: augmentation is seeded per (epoch, row), not per worker.
+    persistent_workers: bool = False
     pin_memory: bool = False  # only honored on CUDA
     amp_dtype: Literal["none", "bf16"] = "none"  # bf16 autocast is CUDA-only
     allow_tf32: bool = False  # CUDA-only; changes float32 matmul numerics
@@ -303,6 +315,8 @@ def validate(cfg: ExperimentConfig) -> None:
     _require(t.lr > 0 and t.weight_decay >= 0, "train.lr must be > 0 and weight_decay >= 0")
     _require(t.grad_clip_norm is None or t.grad_clip_norm > 0, "train.grad_clip_norm must be > 0 or null")
     _require(t.warmup_steps >= 0 and t.num_workers >= 0, "train.warmup_steps/num_workers must be >= 0")
+    _require(t.early_stopping_patience is None or t.early_stopping_patience >= 1, "train.early_stopping_patience must be >= 1 or null")
+    _require(0 <= t.early_stopping_min_delta < 1, "train.early_stopping_min_delta (accuracy units) must be in [0, 1)")
     if t.amp_dtype != "none" or t.allow_tf32:
         _require(t.device in ("cuda", "auto"), "bf16 autocast / TF32 are CUDA-only; set train.device=cuda")
 

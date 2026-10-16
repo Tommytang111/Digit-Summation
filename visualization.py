@@ -66,17 +66,20 @@ def _save(fig, path: Path) -> Path:
 
 
 def plot_loss_curves(records: list[dict], path: Path, title: str = "Training progress") -> Path:
-    """Loss (left) and exact-sum accuracy (right) against optimizer steps (parameter updates).
+    """Loss, exact-sum accuracy, and macro F1 against optimizer steps (parameter updates).
 
     Training values are means over each logging interval, computed in train mode (dropout and
     augmentation on). Validation values are full passes in eval mode.
     """
-    train = [r for r in records if "train/loss" in r]
-    val = [r for r in records if "val/loss" in r]
-    fig, (loss_ax, acc_ax) = plt.subplots(1, 2, figsize=(11, 3.8))
-    for ax, key, label in ((loss_ax, "loss", "Cross-entropy loss"), (acc_ax, "accuracy", "Exact-sum accuracy")):
+    panels = [("loss", "Cross-entropy loss"), ("accuracy", "Exact-sum accuracy"), ("macro_f1", "Macro F1 over sum classes")]
+    # Runs logged before macro F1 existed have no such records; skip panels with no data.
+    panels = [(key, label) for key, label in panels if any(f"train/{key}" in r or f"val/{key}" in r for r in records)]
+    fig, axes = plt.subplots(1, len(panels), figsize=(5.5 * len(panels), 3.8), squeeze=False)
+    for ax, (key, label) in zip(axes[0], panels):
+        train = [r for r in records if f"train/{key}" in r]
+        val = [r for r in records if f"val/{key}" in r]
         if train:
-            ax.plot([r["optimizer_step"] for r in train], [r[f"train/{key}"] for r in train], color=SERIES["train"], label="train (interval mean)")
+            ax.plot([r["optimizer_step"] for r in train], [r[f"train/{key}"] for r in train], color=SERIES["train"], label="train (interval)")
         if val:
             ax.plot(
                 [r["optimizer_step"] for r in val],
@@ -88,9 +91,10 @@ def plot_loss_curves(records: list[dict], path: Path, title: str = "Training pro
             )
         ax.set_xlabel("Optimizer step (parameter updates)")
         ax.set_ylabel(label)
+        if key != "loss":
+            ax.set_ylim(-0.02, 1.02)
         _style(ax)
         ax.legend(loc="best")
-    acc_ax.set_ylim(-0.02, 1.02)
     fig.suptitle(title, color=INK, fontsize=12, x=0.01, ha="left")
     fig.tight_layout()
     return _save(fig, path)

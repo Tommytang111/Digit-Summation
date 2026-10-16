@@ -9,13 +9,13 @@ Vocabulary used throughout:
 
 Reproducibility:
 - Python, NumPy, and torch are seeded from train.seed. The shuffle order of epoch e comes from
-  a permutation seeded by (seed, e). The Albumentations RNG is reseeded per epoch (num_workers=0)
-  or per worker per epoch (num_workers>0). Augmentation streams therefore differ between
-  num_workers settings.
-- Resume is exact at epoch boundaries for data order and model/optimizer/scheduler/RNG state.
-  Mid-epoch resume skips already-consumed batches of the same order, but the augmentation draws
-  for the remaining batches differ from the uninterrupted run (the stream restarts at the
-  epoch's seed). GPU/MPS kernels may also be nondeterministic.
+  a permutation seeded by (seed, e). The sampler yields (row, epoch) pairs, and each row's
+  augmentation is seeded by (augment seed, epoch, row). The training data stream is therefore
+  identical for any num_workers, persistent_workers, or batch size: those settings change speed,
+  not data.
+- Resume restores data order, augmentation, and model/optimizer/scheduler/RNG state, also
+  mid-epoch: already-consumed batches are skipped and the remaining rows get the same
+  augmentations as an uninterrupted run. GPU/MPS kernels may still be nondeterministic.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ import os
 import platform
 import random
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from pathlib import Path
 
@@ -36,7 +36,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Sampler
 
 import visualization as viz
-from augmentations import build_transform, seed_worker
+from augmentations import build_transform, derive_seed, seed_worker
 from config import ExperimentConfig, apply_override, config_from_dict, config_to_dict, load_config
 from dataset import PreparedData, collate_batch, load_prepared_data
 from experiment_logging import ExperimentLogger, read_metrics
@@ -123,19 +123,19 @@ def autocast_context(device: torch.device, amp_dtype: str):
 # ----------------------------------------------------------------------------- seeding + loaders
 
 
-def derive_seed(*parts: int) -> int:
-    """Independent 32-bit seed for a named purpose, e.g. derive_seed(seed, 3, epoch)."""
-    return int(np.random.SeedSequence([int(p) for p in parts]).generate_state(1)[0])
-
-
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed % 2**32)
     torch.manual_seed(seed)  # also seeds CUDA and MPS generators
 
 
-class EpochShuffleSampler(Sampler[int]):
-    """Shuffles with a permutation seeded by (seed, epoch); can skip items to resume mid-epoch."""
+class EpochShuffleSampler(Sampler[tuple[int, int]]):
+    """Shuffles with a permutation seeded by (seed, epoch); can skip items to resume mid-epoch.
+
+    Yields (row, epoch) pairs. The sampler runs in the main process, so the epoch reaches the
+    dataset even inside persistent worker processes, which never see main-process state changes.
+    The dataset uses it to seed that row's augmentation.
+    """
 
     def __init__(self, num_items: int, seed: int):
         self.num_items = num_items
@@ -149,14 +149,19 @@ class EpochShuffleSampler(Sampler[int]):
 
     def __iter__(self):
         order = np.random.default_rng([self.seed, self.epoch]).permutation(self.num_items)
-        return iter(order[self.skip_items :].tolist())
+        return iter([(row, self.epoch) for row in order[self.skip_items :].tolist()])
 
     def __len__(self) -> int:
         return self.num_items - self.skip_items
 
 
 def make_loader(dataset, batch_size: int, device: torch.device, train_cfg, sampler=None, drop_last=False, seed=0) -> DataLoader:
-    """DataLoader with the project's collate, worker seeding, and CUDA-only pinned memory."""
+    """DataLoader with the project's collate, worker seeding, and CUDA-only pinned memory.
+
+    persistent_workers keeps worker processes alive between passes, avoiding the per-epoch and
+    per-validation startup cost (on macOS each worker re-imports torch/albumentations and receives
+    a copy of the dataset). It does not change the data, because augmentation is seeded per row.
+    """
     use_workers = train_cfg.num_workers > 0
     return DataLoader(
         dataset,
@@ -169,7 +174,7 @@ def make_loader(dataset, batch_size: int, device: torch.device, train_cfg, sampl
         pin_memory=bool(train_cfg.pin_memory and device.type == "cuda"),
         worker_init_fn=seed_worker if use_workers else None,
         generator=torch.Generator().manual_seed(seed),
-        persistent_workers=False,  # workers are re-created (and reseeded) every epoch
+        persistent_workers=bool(train_cfg.persistent_workers and use_workers),
     )
 
 
@@ -209,11 +214,33 @@ def build_scheduler(optimizer, train_cfg, total_steps: int) -> torch.optim.lr_sc
 # ----------------------------------------------------------------------------- evaluation
 
 
+def macro_f1_from_counts(true_positives: np.ndarray, predicted: np.ndarray, actual: np.ndarray) -> float:
+    """Macro F1 over sum classes from per-class counts (each an int array of length C).
+
+    Per class c: F1_c = 2 TP_c / (predicted_c + actual_c), which equals 2PR / (P + R).
+    The average runs over classes that occur in the targets OR the predictions (sklearn's
+    average="macro" convention). A class that is only ever predicted, or never predicted,
+    scores 0. Classes absent from both are skipped, since their F1 is undefined.
+    """
+    denominator = predicted + actual
+    present = denominator > 0
+    return float((2.0 * true_positives[present] / denominator[present]).mean())
+
+
+def macro_f1(predictions: np.ndarray, targets: np.ndarray, num_classes: int) -> float:
+    """Macro F1 of integer class predictions vs targets (see macro_f1_from_counts)."""
+    true_positives = np.bincount(targets[predictions == targets], minlength=num_classes)
+    predicted = np.bincount(predictions, minlength=num_classes)
+    actual = np.bincount(targets, minlength=num_classes)
+    return macro_f1_from_counts(true_positives, predicted, actual)
+
+
 @dataclass
 class EvalOutput:
     loss: float
     accuracy: float
     mae: float
+    macro_f1: float
     num_examples: int
     predictions: np.ndarray  # int64 [N]
     targets: np.ndarray  # int64 [N]
@@ -221,12 +248,16 @@ class EvalOutput:
     logits: np.ndarray | None = None  # float32 [N, C] when requested
 
     def metrics(self) -> dict:
-        return {"loss": self.loss, "accuracy": self.accuracy, "mae": self.mae, "n": self.num_examples}
+        return {"loss": self.loss, "accuracy": self.accuracy, "mae": self.mae, "macro_f1": self.macro_f1, "n": self.num_examples}
 
 
 @torch.no_grad()
 def evaluate(model, loader, device: torch.device, amp_dtype: str = "none", keep_logits: bool = False) -> EvalOutput:
-    """Full pass in eval mode (dropout off). MAE is |predicted sum - true sum| averaged."""
+    """Full pass in eval mode (dropout off).
+
+    Every metric is over all sequences of the split. MAE averages |predicted sum - true sum|,
+    and macro F1 weights each sum class equally (see macro_f1_from_counts).
+    """
     was_training = model.training
     model.eval()
     loss_sum = torch.zeros((), device=device)
@@ -238,6 +269,7 @@ def evaluate(model, loader, device: torch.device, amp_dtype: str = "none", keep_
             logits = model(**inputs)
         logits = logits.float()
         loss_sum += F.cross_entropy(logits, batch_targets, reduction="sum")
+        num_classes = logits.shape[-1]
         predictions.append(logits.argmax(dim=-1).cpu())
         targets.append(batch["targets"])
         indices.append(batch["indices"])
@@ -251,6 +283,7 @@ def evaluate(model, loader, device: torch.device, amp_dtype: str = "none", keep_
         loss=float(loss_sum.item()) / count,
         accuracy=float((predictions == targets).mean()),
         mae=float(np.abs(predictions - targets).mean()),
+        macro_f1=macro_f1(predictions, targets, num_classes),
         num_examples=count,
         predictions=predictions,
         targets=targets,
@@ -268,8 +301,19 @@ class TrainState:
     global_step: int = 0  # optimizer.step() calls so far
     micro_batches_into_epoch: int = 0  # consumed micro-batches of the current epoch
     best_val_accuracy: float = -1.0
-    best_val_loss: float = math.inf
+    best_val_loss: float = math.inf  # val loss of the best-accuracy checkpoint
     best_step: int = -1
+    # Early stopping on validation accuracy. This is kept separate from best_val_accuracy because
+    # it applies early_stopping_min_delta and has no loss tie-break.
+    early_stopping_best_accuracy: float = -math.inf
+    validations_without_improvement: int = 0
+    stopped_early: bool = False
+
+    @classmethod
+    def from_checkpoint(cls, saved: dict) -> "TrainState":
+        """Rebuild from a checkpoint, ignoring fields this version no longer has."""
+        known = {f.name for f in fields(cls)}
+        return cls(**{key: value for key, value in saved.items() if key in known})
 
 
 def capture_rng_state() -> dict:
@@ -336,7 +380,25 @@ def save_checkpoint(path: Path, model, optimizer, scheduler, cfg: ExperimentConf
 
 def load_checkpoint(path: Path) -> dict:
     """Load onto the CPU with the safe weights-only unpickler. Move tensors to the target device afterward."""
-    return torch.load(path, map_location="cpu", weights_only=True)
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    upgrade_legacy_config(checkpoint["config"])
+    return checkpoint
+
+
+def upgrade_legacy_config(raw: dict) -> dict:
+    """Fill in options that older checkpoints predate, using the values those runs actually had.
+
+    - Checkpoints saved before `model.cnn_pooling` existed used max pooling. Pooling layers have no
+      weights, so without this fix such a checkpoint would load into a wrongly configured model
+      with no error and silently compute different features.
+    - Checkpoints saved before `model.cnn_activation` / `model.cnn_batch_norm` existed used GELU
+      without BatchNorm (the original encoder). The current defaults are ReLU with BatchNorm.
+    """
+    model = raw.setdefault("model", {})
+    model.setdefault("cnn_pooling", "max")
+    model.setdefault("cnn_activation", "gelu")
+    model.setdefault("cnn_batch_norm", False)
+    return raw
 
 
 def load_model_from_checkpoint(path: Path, device: torch.device) -> tuple[DigitSumTransformer, ExperimentConfig, dict]:
@@ -381,18 +443,24 @@ def _gallery_indices(count: int, k: int, seed: int) -> np.ndarray:
     return np.sort(np.random.default_rng(seed).choice(count, size=min(k, count), replace=False))
 
 
-def save_training_examples(cfg, data: PreparedData, path: Path, num_rows: int = 8) -> Path:
-    """Training-example visualization: what the model sees (augmented, normalized) + targets.
+def augmentation_seed(cfg: ExperimentConfig) -> int:
+    """Base seed of the training augmentation; row r in epoch e uses derive_seed(this, e, r)."""
+    return derive_seed(cfg.train.seed, 1)
 
-    Uses its own transform instance, so drawing the figure does not perturb the training RNG.
+
+def save_training_examples(cfg, data: PreparedData, path: Path, num_rows: int = 8) -> Path:
+    """Training-example visualization: exactly what the model sees for these rows in epoch 0.
+
+    Because augmentation is seeded per (epoch, row), indexing with (row, 0) reproduces the
+    training draw exactly, and drawing the figure cannot perturb the training stream.
     """
     from augmentations import NORMALIZED_BLACK, NORMALIZED_WHITE
 
     manifest = data.manifests["train"]
-    preview_dataset = data.dataset("train", build_transform(cfg.augment, train=True, seed=derive_seed(cfg.train.seed, 99)))
+    preview_dataset = data.dataset("train", build_transform(cfg.augment, train=True), augment_seed=augmentation_seed(cfg))
     rows = []
     for index in _gallery_indices(manifest.num_sequences, num_rows, seed=derive_seed(cfg.train.seed, 98)):
-        item = preview_dataset[int(index)]
+        item = preview_dataset[(int(index), 0)]
         rows.append(
             {
                 "images": [item["images"][p, 0].numpy() if item["is_image"][p] else None for p in range(len(item["is_image"]))],
@@ -401,7 +469,7 @@ def save_training_examples(cfg, data: PreparedData, path: Path, num_rows: int = 
                 "caption": f"row {int(index)}",
             }
         )
-    title = f"Training examples as the model sees them (augment={cfg.augment.mode}, normalized pixels)"
+    title = f"Training examples exactly as the model sees them in epoch 0 (augment={cfg.augment.mode}, normalized pixels)"
     return viz.plot_sequence_gallery(rows, path, title, pixel_range=(NORMALIZED_BLACK, NORMALIZED_WHITE))
 
 
@@ -434,9 +502,9 @@ def run_training(cfg: ExperimentConfig, device: torch.device, resume_checkpoint:
             raise FileExistsError(f"{run_dir} already exists; choose another logging.run_name")
     checkpoint_dir = run_dir / "checkpoints"
 
-    train_transform = build_transform(cfg.augment, train=True, seed=derive_seed(cfg.train.seed, 1))
+    train_transform = build_transform(cfg.augment, train=True)  # reseeded per (epoch, row) by the dataset
     eval_transform = build_transform(cfg.augment, train=False)
-    train_dataset = data.dataset("train", train_transform)
+    train_dataset = data.dataset("train", train_transform, augment_seed=augmentation_seed(cfg))
     val_dataset = data.dataset("val", eval_transform)
     sampler = EpochShuffleSampler(len(train_dataset), seed=derive_seed(cfg.train.seed, 2))
     train_loader = make_loader(train_dataset, cfg.train.batch_size, device, cfg.train, sampler=sampler, drop_last=True)
@@ -459,7 +527,7 @@ def run_training(cfg: ExperimentConfig, device: torch.device, resume_checkpoint:
         model.load_state_dict(resume_checkpoint["model"])
         optimizer.load_state_dict(resume_checkpoint["optimizer"])  # moves state to parameter devices
         scheduler.load_state_dict(resume_checkpoint["scheduler"])
-        state = TrainState(**resume_checkpoint["train_state"])
+        state = TrainState.from_checkpoint(resume_checkpoint["train_state"])
         restore_rng_state(resume_checkpoint["rng"])
         print(f"Resumed from {resume_path} at optimizer step {state.global_step} (epoch {state.epoch}).")
 
@@ -476,7 +544,7 @@ def run_training(cfg: ExperimentConfig, device: torch.device, resume_checkpoint:
             "optimizer_steps_per_epoch": steps_per_epoch,
             "effective_batch_size": cfg.train.batch_size * accumulation,
             "total_optimizer_steps": total_steps,
-            "augmentation_seed": derive_seed(cfg.train.seed, 1),
+            "augmentation_seed": augmentation_seed(cfg),
             "shuffle_seed": derive_seed(cfg.train.seed, 2),
         },
     }
@@ -496,8 +564,19 @@ def run_training(cfg: ExperimentConfig, device: torch.device, resume_checkpoint:
         examples_path = save_training_examples(cfg, data, run_dir / "train_examples.png")
         logger.log_image("examples/train", examples_path, step=0)
 
-    def validate_and_checkpoint() -> None:
+    patience = cfg.train.early_stopping_patience
+
+    def validate_and_checkpoint() -> bool:
+        """Validate, update best/last checkpoints and early-stopping state. Returns True to stop."""
         result = evaluate(model, val_loader, device, cfg.train.amp_dtype)
+        # Early stopping tracks the highest validation accuracy. It is updated before saving, so
+        # checkpoints carry the counter and a resumed run continues the count.
+        if result.accuracy > state.early_stopping_best_accuracy + cfg.train.early_stopping_min_delta:
+            state.early_stopping_best_accuracy, state.validations_without_improvement = result.accuracy, 0
+        else:
+            state.validations_without_improvement += 1
+        stop = patience is not None and state.validations_without_improvement >= patience
+        state.stopped_early = state.stopped_early or stop
         improved = result.accuracy > state.best_val_accuracy or (
             result.accuracy == state.best_val_accuracy and result.loss < state.best_val_loss
         )
@@ -512,18 +591,35 @@ def run_training(cfg: ExperimentConfig, device: torch.device, resume_checkpoint:
                 "val/loss": result.loss,
                 "val/accuracy": result.accuracy,
                 "val/mae": result.mae,
+                "val/macro_f1": result.macro_f1,
                 "val/best_accuracy": state.best_val_accuracy,
+                "val/validations_without_improvement": state.validations_without_improvement,
             },
             step=state.global_step,
         )
         marker = " *best*" if improved else ""
-        print(f"  [val] step {state.global_step:>6}  loss {result.loss:.4f}  acc {result.accuracy:.4f}  mae {result.mae:.3f}{marker}")
+        waiting = f"  [no accuracy improvement {state.validations_without_improvement}/{patience}]" if patience and state.validations_without_improvement else ""
+        print(
+            f"  [val] step {state.global_step:>6}  loss {result.loss:.4f}  acc {result.accuracy:.4f}  "
+            f"macro-F1 {result.macro_f1:.4f}  mae {result.mae:.3f}{marker}{waiting}"
+        )
+        if stop:
+            print(
+                f"Early stopping at optimizer step {state.global_step}: validation accuracy has not improved on "
+                f"{state.early_stopping_best_accuracy:.4f} for {state.validations_without_improvement} consecutive validations."
+            )
+        return stop
 
     def interval_reset():
         synchronize(device)
+        counts = lambda: torch.zeros(cfg.num_classes, device=device, dtype=torch.int64)  # noqa: E731
         return {
             "loss_sum": torch.zeros((), device=device),
             "correct": torch.zeros((), device=device, dtype=torch.int64),
+            # Per-class counts for train macro F1, accumulated on the device (no per-step sync).
+            "true_positives": counts(),
+            "predicted": counts(),
+            "actual": counts(),
             "grad_norm_sum": torch.zeros((), device=device),
             "samples": 0,
             "steps": 0,
@@ -534,16 +630,22 @@ def run_training(cfg: ExperimentConfig, device: torch.device, resume_checkpoint:
     interval = interval_reset()
     training_start = time.perf_counter()
     done = state.global_step >= total_steps
+    if patience is not None and state.validations_without_improvement >= patience:
+        # A resumed run that already met its stopping condition stays stopped; raise
+        # train.early_stopping_patience (or set it to null) to continue training it.
+        print(
+            f"Early-stopping condition already met ({state.validations_without_improvement} validations without "
+            f"improvement, patience {patience}); not training further."
+        )
+        done = True
+    if not done:
+        state.stopped_early = False  # a resumed run that continues training is no longer "stopped"
     model.train()
     try:
         while not done and state.epoch < cfg.train.epochs:
             skip = state.micro_batches_into_epoch
+            # The sampler yields (row, epoch); the dataset seeds each row's augmentation from it.
             sampler.set_epoch(state.epoch, skip_items=skip * cfg.train.batch_size)
-            epoch_seed = derive_seed(cfg.train.seed, 3, state.epoch)
-            if cfg.train.num_workers == 0:
-                train_transform.set_random_seed(epoch_seed)
-            else:
-                train_loader.generator.manual_seed(epoch_seed)  # -> worker seeds -> seed_worker
             optimizer.zero_grad(set_to_none=True)
 
             for micro_index, batch in enumerate(train_loader, start=skip):
@@ -554,7 +656,12 @@ def run_training(cfg: ExperimentConfig, device: torch.device, resume_checkpoint:
                 loss = F.cross_entropy(logits.float(), targets)  # directly on logits
                 (loss / accumulation).backward()
                 interval["loss_sum"] += loss.detach()
-                interval["correct"] += (logits.argmax(dim=-1) == targets).sum()
+                predicted_class = logits.argmax(dim=-1)  # [B]
+                hits = (predicted_class == targets).long()  # [B], 1 where the sum is exact
+                interval["correct"] += hits.sum()
+                interval["true_positives"].scatter_add_(0, targets, hits)
+                interval["predicted"].scatter_add_(0, predicted_class, torch.ones_like(hits))
+                interval["actual"].scatter_add_(0, targets, torch.ones_like(hits))
                 interval["samples"] += targets.numel()
                 state.micro_batches_into_epoch = micro_index + 1
 
@@ -579,6 +686,9 @@ def run_training(cfg: ExperimentConfig, device: torch.device, resume_checkpoint:
                         "epoch": round(state.epoch + state.micro_batches_into_epoch / micro_batches_per_epoch, 4),
                         "train/loss": mean_loss,
                         "train/accuracy": interval["correct"].item() / interval["samples"],
+                        "train/macro_f1": macro_f1_from_counts(
+                            *(interval[k].cpu().numpy() for k in ("true_positives", "predicted", "actual"))
+                        ),
                         "train/lr": scheduler.get_last_lr()[0],
                         "train/samples_per_sec": interval["samples"] / elapsed,  # end-to-end incl. data loading
                         "train/steps_per_sec": interval["steps"] / elapsed,
@@ -588,14 +698,18 @@ def run_training(cfg: ExperimentConfig, device: torch.device, resume_checkpoint:
                     logger.log_metrics(metrics, step=state.global_step)
                     print(
                         f"step {state.global_step:>6}/{total_steps}  epoch {metrics['epoch']:.2f}  loss {mean_loss:.4f}  "
-                        f"acc {metrics['train/accuracy']:.3f}  {metrics['train/samples_per_sec']:.0f} seq/s"
+                        f"acc {metrics['train/accuracy']:.3f}  macro-F1 {metrics['train/macro_f1']:.3f}  "
+                        f"{metrics['train/samples_per_sec']:.0f} seq/s"
                     )
                     interval = interval_reset()
 
                 if state.global_step % cfg.train.eval_every_steps == 0:
-                    validate_and_checkpoint()
+                    should_stop = validate_and_checkpoint()
                     last_validated_step = state.global_step
                     interval = interval_reset()  # exclude validation time from throughput
+                    if should_stop:
+                        done = True
+                        break
 
                 if state.global_step >= total_steps:
                     done = True
@@ -641,10 +755,13 @@ def run_training(cfg: ExperimentConfig, device: torch.device, resume_checkpoint:
         "device": str(device),
         "parameters": parameter_counts["total"],
         "final_optimizer_step": state.global_step,
+        "planned_optimizer_steps": total_steps,
+        "stopped_early": state.stopped_early,
         "epochs_completed": state.epoch,
         "best_step": state.best_step,
         "best_val_accuracy": state.best_val_accuracy,
         "best_val_loss": state.best_val_loss,
+        "best_val_macro_f1": best_result.macro_f1,  # of the accuracy-selected checkpoint
         "effective_batch_size": cfg.train.batch_size * accumulation,
         "training_seconds_this_session": round(training_seconds, 1),
         "data_ids": data_ids,
@@ -652,5 +769,6 @@ def run_training(cfg: ExperimentConfig, device: torch.device, resume_checkpoint:
     }
     logger.log_summary(summary)
     logger.finish()
-    print(f"Done. best val acc {state.best_val_accuracy:.4f} at step {state.best_step}. Checkpoints: {checkpoint_dir}")
+    stop_note = f" Stopped early at step {state.global_step} of {total_steps} planned." if state.stopped_early else ""
+    print(f"Done. best val acc {state.best_val_accuracy:.4f} at step {state.best_step}.{stop_note} Checkpoints: {checkpoint_dir}")
     return run_dir

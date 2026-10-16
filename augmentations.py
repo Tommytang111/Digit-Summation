@@ -23,9 +23,18 @@ the paper's values. In 2.0.8, with noise_distribution="uniform", the displacemen
 `alpha * GaussianBlur(uniform(-1, 1) noise, sigma)` in pixels, blurred with an automatic kernel
 (approximate=False). `inspect_data.py` measures the resulting displacement in pixels.
 
-Seeding: Compose owns its RNG (np.random.seed does not affect it). Training reseeds it once per
-epoch (num_workers=0) or once per worker per epoch via `seed_worker` (num_workers>0). It is never
-reseeded per sample, which would give every image the same "random" transform.
+Seeding: Compose owns its RNG, so np.random.seed does not affect it. Training augmentation is a
+*pure function of (augment seed, epoch, manifest row)*. The sampler yields (row, epoch) pairs, and
+DigitSumDataset reseeds the transform with derive_seed(augment_seed, epoch, row) before
+transforming that row's images. As a result:
+- num_workers, persistent workers, batch size, and resume do not change which augmentation a row
+  gets, so runs that differ only in num_workers see identical data;
+- different rows and epochs get different seeds, so this is not the "same random transform for
+  every sample" bug (which comes from reseeding with one constant);
+- the images within a row draw sequentially from that row's stream.
+`seed_compose` gives Compose and all child transforms ONE shared generator pair. Compose's own
+`set_random_seed` instead gives every child an identically seeded generator, so Affine and
+ElasticTransform would replay the same random numbers.
 """
 
 from __future__ import annotations
@@ -45,12 +54,30 @@ NORMALIZED_BLACK = (0.0 - MNIST_MEAN) / MNIST_STD  # -0.42421: value of a backgr
 NORMALIZED_WHITE = (1.0 - MNIST_MEAN) / MNIST_STD  # 2.82149
 
 
+def derive_seed(*parts: int) -> int:
+    """Independent 32-bit seed for a named purpose, e.g. derive_seed(seed, epoch, row)."""
+    return int(np.random.SeedSequence([int(p) for p in parts]).generate_state(1)[0])
+
+
+def seed_compose(compose: A.Compose, seed: int) -> None:
+    """Seed a Compose so it and all its children draw from ONE shared generator pair.
+
+    albumentations' Compose.set_random_seed(seed) seeds every child with the same value, so two
+    random children (e.g. Affine and ElasticTransform) would produce identical draws. Sharing one
+    numpy Generator and one random.Random makes their draws sequential instead.
+    """
+    seed = int(seed) % 2**32
+    compose.set_random_state(np.random.default_rng(seed), random.Random(seed))
+
+
 class MnistTransform:
     """Callable wrapper: raw uint8 [28, 28] -> normalized float32 [28, 28]."""
 
-    def __init__(self, compose: A.Compose, mode: str):
+    def __init__(self, compose: A.Compose, mode: str, seed: int | None = None):
         self.compose = compose
         self.mode = mode
+        if seed is not None:
+            self.set_random_seed(seed)
 
     def __call__(self, raw_pixels: np.ndarray) -> np.ndarray:
         if raw_pixels.dtype != np.uint8 or raw_pixels.ndim != 2:
@@ -61,8 +88,8 @@ class MnistTransform:
         return output
 
     def set_random_seed(self, seed: int) -> None:
-        """Reseed Albumentations' internal generators (Compose and every child transform)."""
-        self.compose.set_random_seed(int(seed) % 2**32)
+        """Reseed Albumentations' generators (one stream shared by Compose and every child)."""
+        seed_compose(self.compose, seed)
 
 
 def geometric_transforms(aug_cfg, mode: str) -> list:
@@ -104,15 +131,16 @@ def build_transform(aug_cfg, train: bool, seed: int | None = None, mode: str | N
     chosen_mode = (mode or aug_cfg.mode) if train else "none"
     ops = geometric_transforms(aug_cfg, chosen_mode)
     ops.append(A.Normalize(mean=(MNIST_MEAN,), std=(MNIST_STD,), max_pixel_value=255.0))
-    return MnistTransform(A.Compose(ops, seed=seed), chosen_mode)
+    return MnistTransform(A.Compose(ops), chosen_mode, seed=seed)
 
 
 def seed_worker(worker_id: int) -> None:
     """DataLoader worker_init_fn: give each worker distinct, reproducible RNG streams.
 
-    torch sets each worker's seed to base_seed + worker_id, where base_seed is drawn from the
-    DataLoader's generator when the epoch's iterator is created. Python, NumPy, and this worker's
-    copy of the Albumentations transform are reseeded from that value.
+    Training rows are reseeded per (epoch, row) by the dataset, so this matters only for accesses
+    that carry no epoch (plain integer indices). Without it, every worker would start from an
+    identical copy of the transform's RNG and replay the same "random" augmentations.
+    torch sets each worker's seed to base_seed + worker_id.
     """
     info = torch.utils.data.get_worker_info()
     seed = int(info.seed) % 2**32

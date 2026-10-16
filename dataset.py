@@ -26,6 +26,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from augmentations import derive_seed
 from tokenizer import PAD_ID, encode_operand
 
 PARTITIONS = ("train", "test")  # official MNIST partitions
@@ -449,6 +450,12 @@ def load_manifests(directory: Path) -> dict[str, SequenceManifest]:
 class DigitSumDataset(Dataset):
     """Turns manifest rows into model inputs on access; pixels are fetched and transformed lazily.
 
+    Keys: an integer row, or a (row, epoch) pair (what engine.EpochShuffleSampler yields). With a
+    (row, epoch) key and an `augment_seed`, the transform is reseeded with
+    derive_seed(augment_seed, epoch, row) first. That row's augmentation in that epoch is then
+    identical no matter which worker or process builds it, in what order, or with what batch size.
+    Integer keys skip the reseed and continue the transform's current stream.
+
     __getitem__ returns (shapes for one sequence of length L):
         images:    float32 [L, 1, 28, 28]  transformed pixels; text slots hold a 0.0 placeholder
         token_ids: int64   [L]             digit token IDs; image slots hold PAD_ID
@@ -458,17 +465,21 @@ class DigitSumDataset(Dataset):
         index:     int                     row index in the manifest
     """
 
-    def __init__(self, manifest: SequenceManifest, partition_images: np.ndarray, transform):
+    def __init__(self, manifest: SequenceManifest, partition_images: np.ndarray, transform, augment_seed: int | None = None):
         if partition_images.dtype != np.uint8 or partition_images.shape[1:] != IMAGE_SHAPE:
             raise ValueError("partition_images must be uint8 [N, 28, 28] raw MNIST pixels")
         self.manifest = manifest
         self.partition_images = partition_images
         self.transform = transform  # uint8 [28, 28] -> float32 [28, 28]; owns its RNG
+        self.augment_seed = augment_seed
 
     def __len__(self) -> int:
         return self.manifest.num_sequences
 
-    def __getitem__(self, index: int) -> dict:
+    def __getitem__(self, key) -> dict:
+        index, epoch = (int(key[0]), int(key[1])) if isinstance(key, tuple) else (int(key), None)
+        if epoch is not None and self.augment_seed is not None:
+            self.transform.set_random_seed(derive_seed(self.augment_seed, epoch, index))
         digits_row = self.manifest.digits[index]
         is_image_row = self.manifest.is_image[index]
         source_row = self.manifest.source_index[index]
@@ -544,9 +555,9 @@ class PreparedData:
             "manifest_ids": {name: manifest.manifest_id() for name, manifest in self.manifests.items()},
         }
 
-    def dataset(self, name_or_manifest, transform) -> DigitSumDataset:
+    def dataset(self, name_or_manifest, transform, augment_seed: int | None = None) -> DigitSumDataset:
         manifest = self.manifests[name_or_manifest] if isinstance(name_or_manifest, str) else name_or_manifest
-        return DigitSumDataset(manifest, self.arrays.images[manifest.partition], transform)
+        return DigitSumDataset(manifest, self.arrays.images[manifest.partition], transform, augment_seed)
 
 
 def load_prepared_data(data_cfg) -> PreparedData:

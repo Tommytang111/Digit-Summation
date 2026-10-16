@@ -37,25 +37,51 @@ TEXT_MODALITY, IMAGE_MODALITY = 0, 1
 class ImageEncoder(nn.Module):
     """Shared CNN: float32 [N, 1, 28, 28] -> float32 [N, d_model].
 
-    conv3x3(1->32) GELU maxpool2 -> [N, 32, 14, 14]
-    conv3x3(32->64) GELU maxpool2 -> [N, 64, 7, 7]
+    Default (ReLU, max pooling, BatchNorm):
+    conv3x3(1->32, no bias) BatchNorm ReLU maxpool2 -> [N, 32, 14, 14]
+    conv3x3(32->64, no bias) BatchNorm ReLU maxpool2 -> [N, 64, 7, 7]
     flatten -> [N, 3136] -> Linear -> [N, d_model] -> LayerNorm
 
-    The final LayerNorm gives image features roughly unit per-dimension scale, matching the
-    N(0, 1) initialization of nn.Embedding, so neither modality dominates the residual stream
-    at initialization.
+    - activation: "relu" (default) or "gelu" (the original encoder).
+    - pooling: "max" keeps the largest of each 2x2 window (default); "avg" averages it.
+    - batch_norm: normalizes each channel after its conv. It uses statistics of the images in
+      the current batch during training, and running averages in eval mode. The conv bias is
+      dropped because BatchNorm's learned shift replaces it. The sum model gathers only real
+      image slots before the CNN, so text placeholders never enter the batch statistics.
+    In a 3-seed standalone digit benchmark (CNN-encoder-test/), ReLU + max + BatchNorm reached
+    0.9924 vs 0.9915 validation digit accuracy for GELU + avg without BatchNorm.
+
+    With batch_norm=False the layer order matches the original encoder (conv, act, pool), so
+    older checkpoints load unchanged. The final LayerNorm gives image features roughly unit
+    per-dimension scale, matching the N(0, 1) initialization of nn.Embedding, so neither
+    modality dominates the residual stream at initialization.
     """
 
-    def __init__(self, d_model: int = 128, conv1_channels: int = 32, conv2_channels: int = 64):
+    def __init__(
+        self,
+        d_model: int = 128,
+        conv1_channels: int = 32,
+        conv2_channels: int = 64,
+        pooling: str = "max",
+        activation: str = "relu",
+        batch_norm: bool = True,
+    ):
         super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(1, conv1_channels, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(conv1_channels, conv2_channels, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.MaxPool2d(2),
-        )
+        pool_layers = {"avg": nn.AvgPool2d, "max": nn.MaxPool2d}
+        activations = {"relu": nn.ReLU, "gelu": nn.GELU}
+        if pooling not in pool_layers:
+            raise ValueError(f"pooling must be 'avg' or 'max', got {pooling!r}")
+        if activation not in activations:
+            raise ValueError(f"activation must be 'relu' or 'gelu', got {activation!r}")
+        pool, act = pool_layers[pooling], activations[activation]
+
+        def stage(in_channels: int, out_channels: int) -> list[nn.Module]:
+            layers = [nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=not batch_norm)]
+            if batch_norm:
+                layers.append(nn.BatchNorm2d(out_channels))
+            return layers + [act(), pool(2)]
+
+        self.features = nn.Sequential(*stage(1, conv1_channels), *stage(conv1_channels, conv2_channels))
         self.projection = nn.Linear(conv2_channels * 7 * 7, d_model)
         self.norm = nn.LayerNorm(d_model)
 
@@ -78,11 +104,16 @@ class DigitSumTransformer(nn.Module):
         dropout: float = 0.1,
         conv1_channels: int = 32,
         conv2_channels: int = 64,
+        cnn_pooling: str = "max",
+        cnn_activation: str = "relu",
+        cnn_batch_norm: bool = True,
         use_modality_embedding: bool = True,
         norm_first: bool = True,
     ):
         super().__init__()
-        self.image_encoder = ImageEncoder(d_model, conv1_channels, conv2_channels)
+        self.image_encoder = ImageEncoder(
+            d_model, conv1_channels, conv2_channels, pooling=cnn_pooling, activation=cnn_activation, batch_norm=cnn_batch_norm
+        )
         # Row PAD_ID is initialized to zeros and never receives gradient.
         self.token_embedding = nn.Embedding(VOCAB_SIZE, d_model, padding_idx=PAD_ID)
         # The modality embedding tags each slot with which encoder produced it (text or CNN), so
@@ -177,6 +208,9 @@ def build_model(cfg) -> DigitSumTransformer:
         dropout=m.dropout,
         conv1_channels=m.conv1_channels,
         conv2_channels=m.conv2_channels,
+        cnn_pooling=m.cnn_pooling,
+        cnn_activation=m.cnn_activation,
+        cnn_batch_norm=m.cnn_batch_norm,
         use_modality_embedding=m.use_modality_embedding,
         norm_first=m.norm_first,
     )
