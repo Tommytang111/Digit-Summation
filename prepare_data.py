@@ -93,8 +93,20 @@ def build_all(cfg, arrays: MnistArrays) -> tuple[SourcePools, dict[str, Sequence
 # ----------------------------------------------------------------------------- audit
 
 
-def run_leakage_audit(arrays: MnistArrays, pools: SourcePools, manifests: dict[str, SequenceManifest]) -> dict:
+def run_leakage_audit(
+    arrays: MnistArrays, pools: SourcePools, manifests: dict[str, SequenceManifest], text_only_duplicates: str = "fail"
+) -> dict:
     """Executable leakage audit. Hard checks decide `passed`; `info` is descriptive.
+
+    text_only_duplicates:
+      "fail"   (main task) every cross-manifest duplicate input is a hard failure.
+      "report" (length-generalization bonus) duplicates among rows that contain an image are
+               still hard failures *between different pools* (train/val/test), but all-text
+               duplicates are only counted. At short lengths they are unavoidable (length 1 has
+               only 10 possible text inputs). Two manifests of the same pool (e.g. test_L01 and
+               test_all_image_L01) may share an image input, which is not leakage and is reported.
+               Only same-length manifests are compared, because a key lists every operand, so
+               different lengths can never share one.
 
     Hard checks:
       - source pools are disjoint as (partition, index) IDs
@@ -156,8 +168,26 @@ def run_leakage_audit(arrays: MnistArrays, pools: SourcePools, manifests: dict[s
             "distinct_target_sums": int(np.unique(manifest.targets).size),
         }
 
+    if text_only_duplicates not in ("fail", "report"):
+        raise ValueError(f"text_only_duplicates must be 'fail' or 'report', got {text_only_duplicates!r}")
     names = list(manifests)
+    text_only_overlap, same_split_overlap = [], []
     for a, b in combinations(names, 2):
+        if text_only_duplicates == "report":
+            if manifests[a].sequence_length != manifests[b].sequence_length:
+                continue
+            has_image = {n: manifests[n].is_image.any(axis=1) for n in (a, b)}  # [N] per manifest
+            image_keys = [{k for k, keep in zip(keys[n][1], has_image[n]) if keep} for n in (a, b)]
+            text_keys = [{k for k, keep in zip(keys[n][0], has_image[n]) if not keep} for n in (a, b)]
+            shared_images = image_keys[0] & image_keys[1]
+            if manifests[a].pool_split != manifests[b].pool_split:  # leakage = across train/val/test only
+                check(f"no duplicate inputs among rows with an image: {a} vs {b}", not shared_images, f"{len(shared_images)} shared")
+            elif shared_images:  # e.g. test_L01 vs test_all_image_L01 reusing a test image: same split, not leakage
+                same_split_overlap.append({"pair": f"{a} vs {b}", "shared_inputs_with_image": len(shared_images)})
+            shared_text = text_keys[0] & text_keys[1]
+            if shared_text:
+                text_only_overlap.append({"pair": f"{a} vs {b}", "shared_all_text_inputs": len(shared_text)})
+            continue
         exact_shared = set(keys[a][0]) & set(keys[b][0])
         canonical_shared = set(keys[a][1]) & set(keys[b][1])
         check(f"no exact complete-input duplicates: {a} vs {b}", not exact_shared, f"{len(exact_shared)} shared inputs")
@@ -180,6 +210,9 @@ def run_leakage_audit(arrays: MnistArrays, pools: SourcePools, manifests: dict[s
     train_sums = set(np.unique(manifests["train"].targets).tolist()) if "train" in manifests else set()
     info = {
         "manifests": info_manifests,
+        "text_only_duplicates_policy": text_only_duplicates,
+        "all_text_cross_manifest_overlap": text_only_overlap,
+        "same_split_image_input_overlap": same_split_overlap,
         "legitimate_reuse": {
             "note": "Reused digit values and reused target sums across splits are expected and not leakage.",
             "test_sums_also_in_train": len(set(np.unique(manifests["test"].targets).tolist()) & train_sums) if "test" in manifests else None,
@@ -221,6 +254,30 @@ def print_audit(report: dict, pools: SourcePools) -> None:
     print("AUDIT PASSED" if report["passed"] else "AUDIT FAILED")
 
 
+def save_or_verify_frozen(directory: Path, pools: SourcePools, manifests: dict[str, SequenceManifest], extra: dict, overwrite: bool) -> bool:
+    """Write pools + manifests, or verify they equal the frozen copy on disk.
+
+    Returns False (and writes nothing) if frozen data exists and differs, unless `overwrite`.
+    Used by prepare_data.py (main task) and prepare_bonus_data.py (bonus).
+    """
+    if (directory / "manifests.json").exists() and not overwrite:
+        disk_pools, disk_manifests = load_source_pools(directory), load_manifests(directory)
+        differences = ["source pools"] if disk_pools.pool_id() != pools.pool_id() else []
+        for name in sorted(set(manifests) | set(disk_manifests)):
+            if name not in manifests or name not in disk_manifests or manifests[name].manifest_id() != disk_manifests[name].manifest_id():
+                differences.append(name)
+        if differences:
+            print(f"Frozen data in {directory} differs from what this config generates: {differences}")
+            print("Refusing to overwrite. Use a different manifest_dir, or pass --overwrite deliberately.")
+            return False
+        print(f"Frozen data in {directory} verified: regeneration is identical (pool {pools.pool_id()}). Nothing rewritten.")
+        return True
+    save_source_pools(pools, directory)
+    save_manifests(manifests, directory, extra)
+    print(f"Wrote source pools + {len(manifests)} manifests to {directory}")
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", required=True)
@@ -238,24 +295,9 @@ def main() -> int:
         pools, manifests = load_source_pools(directory), load_manifests(directory)
     else:
         pools, manifests = build_all(cfg, arrays)
-        if (directory / "manifests.json").exists() and not args.overwrite:
-            disk_pools, disk_manifests = load_source_pools(directory), load_manifests(directory)
-            differences = []
-            if disk_pools.pool_id() != pools.pool_id():
-                differences.append("source pools")
-            for name in sorted(set(manifests) | set(disk_manifests)):
-                if name not in manifests or name not in disk_manifests or manifests[name].manifest_id() != disk_manifests[name].manifest_id():
-                    differences.append(name)
-            if differences:
-                print(f"Frozen data in {directory} differs from what this config generates: {differences}")
-                print("Refusing to overwrite. Use a different data.manifest_dir, or pass --overwrite deliberately.")
-                return 2
-            print(f"Frozen data in {directory} verified: regeneration is identical (pool {pools.pool_id()}). Nothing rewritten.")
-        else:
-            save_source_pools(pools, directory)
-            extra = {"config_name": cfg.name, "data_config": config_to_dict(cfg)["data"], "pool_id": pools.pool_id(), "created": datetime.now().isoformat()}
-            save_manifests(manifests, directory, extra)
-            print(f"Wrote source pools + {len(manifests)} manifests to {directory}")
+        extra = {"config_name": cfg.name, "data_config": config_to_dict(cfg)["data"], "pool_id": pools.pool_id(), "created": datetime.now().isoformat()}
+        if not save_or_verify_frozen(directory, pools, manifests, extra, overwrite=args.overwrite):
+            return 2
 
     report = run_leakage_audit(arrays, pools, manifests)
     with open(directory / "leakage_audit.json", "w") as handle:

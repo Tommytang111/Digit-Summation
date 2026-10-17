@@ -164,6 +164,35 @@ class EvalConfig:
     num_stress_image_sequences: int = 50
 
 
+BonusArchitecture = Literal["items_only_sinusoidal", "items_only_no_positions", "sinusoidal_plus_sum_summary"]
+
+
+@dataclass
+class BonusConfig:
+    """Length-generalization bonus: variable-length operand sequences -> sum written by a decoder.
+
+    Only the bonus entry points read this section; the main-task scripts ignore it. The source
+    pools, image probability, seeds, and augmentation come from the data/augment sections, and the
+    operand encoder (CNN, embeddings, encoder layers) from the model section.
+    """
+
+    architecture: BonusArchitecture = "items_only_sinusoidal"
+    manifest_dir: str = "data/manifests/bonus"
+    min_train_length: int = 1
+    max_train_length: int = 10  # training lengths are uniform over [min, max] by default
+    max_eval_length: int = 20  # evaluation at every length 1..max_eval_length
+    num_train_sequences: int = 100_000  # total, split evenly across training lengths
+    num_eval_per_length: int = 1_000  # val and test, each length
+    num_all_image_per_length: int = 200  # val and test all-image diagnostic sets, each length
+    decoder_layers: int = 2
+    decoder_heads: int = 4
+    decoder_feedforward: int = 512
+    decoder_dropout: float = 0.1
+    max_new_tokens: int = 4  # generation cap after BOS: three digits + EOS (sums up to 180)
+    summary_scale: float = 0.1  # sum-summary ablation only: fixed scale, identical at all lengths
+    eval_batch_size: int = 512
+
+
 @dataclass
 class ExperimentConfig:
     name: str = "debug"
@@ -174,6 +203,7 @@ class ExperimentConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     overfit: OverfitConfig = field(default_factory=OverfitConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
+    bonus: BonusConfig = field(default_factory=BonusConfig)
 
     @property
     def num_classes(self) -> int:
@@ -323,3 +353,13 @@ def validate(cfg: ExperimentConfig) -> None:
     _require(o.num_examples >= 1 and o.max_steps >= 1 and o.batch_size >= 1, "overfit sizes must be >= 1")
     _require(0.0 < o.target_accuracy <= 1.0, "overfit.target_accuracy must be in (0, 1]")
     _require(o.image_probability is None or 0.0 <= o.image_probability <= 1.0, "overfit.image_probability must be in [0, 1] or null")
+
+    b = cfg.bonus
+    _require(1 <= b.min_train_length <= b.max_train_length <= b.max_eval_length, "bonus lengths need 1 <= min_train <= max_train <= max_eval")
+    _require(b.num_train_sequences >= b.max_train_length - b.min_train_length + 1, "bonus.num_train_sequences must give >= 1 row per training length")
+    _require(b.num_eval_per_length >= 1 and b.num_all_image_per_length >= 1, "bonus eval sizes must be >= 1")
+    _require(b.decoder_layers >= 1 and m.d_model % b.decoder_heads == 0, "bonus decoder: >= 1 layer and d_model divisible by decoder_heads")
+    _require(0.0 <= b.decoder_dropout < 1.0, "bonus.decoder_dropout must be in [0, 1)")
+    # 9 * max_eval_length can need three digits (e.g. 180), so the cap must allow 3 digits + EOS.
+    _require(b.max_new_tokens >= len(str(9 * b.max_eval_length)) + 1, "bonus.max_new_tokens must allow the longest possible answer plus EOS")
+    _require(b.summary_scale > 0, "bonus.summary_scale must be > 0")

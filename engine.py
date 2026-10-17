@@ -155,7 +155,9 @@ class EpochShuffleSampler(Sampler[tuple[int, int]]):
         return self.num_items - self.skip_items
 
 
-def make_loader(dataset, batch_size: int, device: torch.device, train_cfg, sampler=None, drop_last=False, seed=0) -> DataLoader:
+def make_loader(
+    dataset, batch_size: int, device: torch.device, train_cfg, sampler=None, drop_last=False, seed=0, collate_fn=collate_batch
+) -> DataLoader:
     """DataLoader with the project's collate, worker seeding, and CUDA-only pinned memory.
 
     persistent_workers keeps worker processes alive between passes, avoiding the per-epoch and
@@ -169,7 +171,7 @@ def make_loader(dataset, batch_size: int, device: torch.device, train_cfg, sampl
         sampler=sampler,
         shuffle=False,  # order comes from the sampler (or is sequential for evaluation)
         drop_last=drop_last,
-        collate_fn=collate_batch,
+        collate_fn=collate_fn,  # bonus runs pass bonus_data.bonus_collate (adds answer tensors)
         num_workers=train_cfg.num_workers,
         pin_memory=bool(train_cfg.pin_memory and device.type == "cuda"),
         worker_init_fn=seed_worker if use_workers else None,
@@ -351,8 +353,14 @@ def restore_rng_state(state: dict) -> None:
         torch.mps.set_rng_state(state["mps"].cpu())
 
 
-def save_checkpoint(path: Path, model, optimizer, scheduler, cfg: ExperimentConfig, state: TrainState, data_ids: dict) -> Path:
-    """Atomic save (write to a temp file, then rename) of everything needed to resume or evaluate."""
+def save_checkpoint(
+    path: Path, model, optimizer, scheduler, cfg: ExperimentConfig, state: TrainState, data_ids: dict, extra: dict | None = None
+) -> Path:
+    """Atomic save (write to a temp file, then rename) of everything needed to resume or evaluate.
+
+    `extra` adds task-specific fields (the bonus stores task="bonus_decoder" and its output
+    vocabulary); main-task checkpoints pass nothing and are unchanged.
+    """
     import albumentations
     import torchvision
 
@@ -369,6 +377,7 @@ def save_checkpoint(path: Path, model, optimizer, scheduler, cfg: ExperimentConf
         "rng": capture_rng_state(),
         # str(): torch.__version__ is a TorchVersion object, which the weights-only unpickler rejects.
         "versions": {"torch": str(torch.__version__), "torchvision": str(torchvision.__version__), "albumentations": str(albumentations.__version__)},
+        **(extra or {}),
     }
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -404,6 +413,11 @@ def upgrade_legacy_config(raw: dict) -> dict:
 def load_model_from_checkpoint(path: Path, device: torch.device) -> tuple[DigitSumTransformer, ExperimentConfig, dict]:
     """Rebuild the model from the checkpoint's own config and load weights on any device."""
     checkpoint = load_checkpoint(path)
+    if checkpoint.get("task", "classifier") != "classifier":
+        raise ValueError(
+            f"{path} is a {checkpoint['task']!r} checkpoint, not a main-task classifier. "
+            "Use evaluate_bonus.py / bonus_engine.load_bonus_model for length-generalization checkpoints."
+        )
     if checkpoint["vocab"] != dict(VOCAB):
         raise ValueError("Checkpoint vocabulary differs from tokenizer.VOCAB")
     cfg = config_from_dict(checkpoint["config"])

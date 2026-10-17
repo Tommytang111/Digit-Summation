@@ -1,0 +1,71 @@
+# Length-generalization bonus on the M4 Pro (MPS, float32). Start it explicitly; nothing runs it
+# automatically. Variants are compared by changing ONLY bonus.architecture (same data, budget,
+# augmentation, and evaluation):
+#   --set bonus.architecture=items_only_sinusoidal        (primary)
+#   --set bonus.architecture=items_only_no_positions
+#   --set bonus.architecture=sinusoidal_plus_sum_summary  (follow-up ablation)
+name: bonus-local
+
+data:
+  train_source_fraction: 1.0     # the same 50k / 10k / 10k image pools as the main task
+  val_source_fraction: 1.0
+  test_source_fraction: 1.0
+  image_probability: 0.5
+
+augment:
+  mode: affine
+
+model:
+  cnn_activation: relu
+  cnn_pooling: max
+  cnn_batch_norm: true
+
+bonus:
+  architecture: items_only_sinusoidal
+  manifest_dir: data/manifests/bonus
+  min_train_length: 1
+  max_train_length: 10           # training lengths 1-10, uniform (10,000 rows each)
+  max_eval_length: 20            # evaluation at every length 1-20
+  num_train_sequences: 100000
+  num_eval_per_length: 1000      # val and test, each length
+  num_all_image_per_length: 200
+  decoder_layers: 2
+  decoder_heads: 4
+  decoder_feedforward: 512
+  decoder_dropout: 0.1
+  max_new_tokens: 4              # three digits + EOS; never a two-digit limit
+  summary_scale: 0.1             # sum-summary ablation only
+  eval_batch_size: 512
+
+train:
+  device: auto
+  seed: 0
+  batch_size: 256                # 100000 // 256 = 390 optimizer steps per epoch
+  grad_accum_steps: 1            # the bonus loop requires 1
+  epochs: 100                    # 39,000 optimizer steps (early stopping may end sooner)
+  max_steps: null
+  eval_every_steps: 1000         # free-generation validation on lengths 1-10 only
+  log_every_steps: 50
+  lr: 3.0e-4
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  lr_schedule: warmup_cosine
+  warmup_steps: 500
+  early_stopping_patience: 15
+  early_stopping_min_delta: 0.0
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: false
+  amp_dtype: none
+
+logging:
+  wandb_mode: online
+  wandb_project: digit-summation
+  wandb_entity: neoscith-solo
+
+overfit:
+  num_examples: 64
+  max_steps: 300
+  lr: 1.0e-3
+  batch_size: 64
+  eval_every_steps: 10

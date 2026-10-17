@@ -1,0 +1,51 @@
+# Length-generalization bonus: tiny configuration for wiring checks and smoke runs.
+# Results from this config say nothing about convergence, accuracy, or length generalization.
+name: bonus-debug
+
+data:
+  # 5% stratified subsets of each image pool (~2.5k train, 500 val, 500 test images).
+  train_source_fraction: 0.05
+  val_source_fraction: 0.05
+  test_source_fraction: 0.05
+  image_probability: 0.5   # P(operand is an MNIST image), independently per position
+
+augment:
+  mode: affine             # training only; val/test/diagnostics always use Normalize only
+
+model:                     # operand encoder (same settings as the main task)
+  cnn_activation: relu
+  cnn_pooling: max
+  cnn_batch_norm: true
+
+bonus:
+  architecture: items_only_sinusoidal   # | items_only_no_positions | sinusoidal_plus_sum_summary
+  manifest_dir: data/manifests/bonus-debug
+  min_train_length: 1
+  max_train_length: 10
+  max_eval_length: 20
+  num_train_sequences: 2000      # 200 per training length
+  num_eval_per_length: 30        # val and test, each length 1-20
+  num_all_image_per_length: 10
+  max_new_tokens: 4              # three digits + EOS
+  eval_batch_size: 256
+
+train:
+  device: auto
+  batch_size: 64
+  epochs: 5
+  max_steps: 60                  # hard cap on optimizer updates
+  eval_every_steps: 20
+  log_every_steps: 10
+  lr: 3.0e-4
+  lr_schedule: constant
+  num_workers: 0
+
+logging:
+  wandb_mode: disabled
+
+overfit:                         # bonus_checks.py overfit: aug + dropout forced off
+  num_examples: 64
+  max_steps: 300                 # initial cap
+  lr: 1.0e-3
+  batch_size: 64
+  eval_every_steps: 10

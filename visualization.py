@@ -128,6 +128,8 @@ def plot_sequence_gallery(rows: list[dict], path: Path, title: str, pixel_range:
 
     Each row dict has: images (list of [28, 28] arrays or None for text), tokens (list of str for
     text slots or None), target (int), and optionally prediction (int) and caption (str).
+    Generated answers (bonus) pass prediction_text (str, may describe an invalid output) and an
+    explicit correct (bool) instead of prediction.
     `pixel_range` is (0, 255) for raw pixels or the normalized black/white values for model views.
     """
     if not rows:
@@ -153,12 +155,17 @@ def plot_sequence_gallery(rows: list[dict], path: Path, title: str, pixel_range:
                 ax.text(0.5, 0.45, row["tokens"][c], ha="center", va="center", fontsize=20, color=INK, transform=ax.transAxes)
                 ax.text(0.5, 0.06, "text", ha="center", va="bottom", fontsize=6, color=INK_MUTED, transform=ax.transAxes)
         caption = f"sum {row['target']}"
-        if row.get("prediction") is not None:
+        if row.get("prediction_text") is not None:  # generated answers (bonus): text may be invalid
+            caption += f"\npred {row['prediction_text']} {'✓' if row.get('correct') else '✗'}"
+        elif row.get("prediction") is not None:
             correct = row["prediction"] == row["target"]
             caption += f"\npred {row['prediction']} {'✓' if correct else '✗'}"
         if row.get("caption"):
             caption += f"\n{row['caption']}"
-        color = INK if row.get("prediction") is None else (GOOD if row["prediction"] == row["target"] else CRITICAL)
+        if "correct" in row:
+            color = GOOD if row["correct"] else CRITICAL
+        else:
+            color = INK if row.get("prediction") is None else (GOOD if row["prediction"] == row["target"] else CRITICAL)
         axes[r, -1].text(1.12, 0.5, caption, transform=axes[r, -1].transAxes, va="center", ha="left", fontsize=8.5, color=color)
     fig.suptitle(title, color=INK, fontsize=12, x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0, 0.92, 0.97))
@@ -311,6 +318,48 @@ def plot_metric_summary(main: dict, baseline: dict, split: str, path: Path, titl
             ax.spines[side].set_visible(False)
         ax.grid(axis="x", color=GRID, linewidth=0.6)
         ax.set_axisbelow(True)
+    fig.suptitle(title, color=INK, fontsize=12, x=0.01, ha="left")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+def plot_by_length(
+    series: dict[str, list[tuple[int, float | None]]],
+    path: Path,
+    title: str,
+    ylabel: str,
+    max_train_length: int,
+    counts: dict[int, int] | None = None,
+    ylim: tuple[float, float] | None = (-0.02, 1.02),
+) -> Path:
+    """A metric against operand-sequence length, one line per series.
+
+    Lengths <= max_train_length (seen in training) are shaded; longer ones are extrapolation.
+    `counts` (rows per length) is printed under the x-axis so every point carries its n.
+    Points with value None (no rows) are skipped.
+    """
+    palette = [SERIES["train"], SERIES["val"], SERIES["test"], INK_SECONDARY, "#8a63d2"]
+    fig, ax = plt.subplots(figsize=(13, 4.2))
+    all_lengths = sorted({length for points in series.values() for length, _ in points})
+    if all_lengths:
+        ax.axvspan(min(all_lengths) - 0.5, max_train_length + 0.5, color=GRID, alpha=0.45, linewidth=0)
+        # Region labels sit just above the axes, so they never collide with data near y = 1.
+        ax.text((min(all_lengths) + max_train_length) / 2, 1.01, f"trained lengths {min(all_lengths)}-{max_train_length}", transform=ax.get_xaxis_transform(), fontsize=8, color=INK_MUTED, va="bottom", ha="center")
+        if max(all_lengths) > max_train_length:
+            ax.text((max_train_length + 1 + max(all_lengths)) / 2, 1.01, f"extrapolation {max_train_length + 1}-{max(all_lengths)}", transform=ax.get_xaxis_transform(), fontsize=8, color=INK_MUTED, va="bottom", ha="center")
+    for (label, points), color in zip(series.items(), palette):
+        kept = [(length, value) for length, value in points if value is not None]
+        if kept:
+            ax.plot([length for length, _ in kept], [value for _, value in kept], color=color, marker="o", markersize=4, label=label)
+    ax.set_xticks(all_lengths)
+    if counts:
+        ax.set_xticklabels([f"{length}\nn={counts.get(length, 0)}" for length in all_lengths], fontsize=7)
+    ax.set_xlabel("Number of operands (sequence length)")
+    ax.set_ylabel(ylabel)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    _style(ax)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0))  # outside the plot: never covers data
     fig.suptitle(title, color=INK, fontsize=12, x=0.01, ha="left")
     fig.tight_layout()
     return _save(fig, path)

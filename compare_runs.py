@@ -62,7 +62,9 @@ def main(run_dirs: list[str]) -> int:
         return 1
     runs = [load(Path(d)) for d in run_dirs]
     reference = runs[0]["data_ids"]
-    shared_keys = ("val", "test", "val_text_only", "val_all_image", "test_text_only", "test_all_image")
+    # Every evaluation manifest (everything except training data) must be identical across runs.
+    # This covers the main task (val, test, diagnostics) and the bonus (val_L01.., test_L01.., ...).
+    shared_keys = sorted(k for k in reference["manifest_ids"] if not k.startswith("train"))
     controlled = all(
         r["data_ids"]["source_pool_id"] == reference["source_pool_id"]
         and all(r["data_ids"]["manifest_ids"].get(k) == reference["manifest_ids"].get(k) for k in shared_keys)
@@ -94,7 +96,8 @@ def main(run_dirs: list[str]) -> int:
     all_keys = set().union(*(r["config_flat"] for r in runs))
     differing = sorted(k for k in all_keys if len({json.dumps(r["config_flat"].get(k)) for r in runs}) > 1)
     print(f"\nControlled comparison (same pools + eval manifests): {'YES' if controlled else 'NO'}")
-    print(f"Same training manifest: {'yes' if len({r['data_ids']['manifest_ids']['train'] for r in runs}) == 1 else 'no'}")
+    train_ids = lambda r: tuple(sorted((k, v) for k, v in r["data_ids"]["manifest_ids"].items() if k.startswith("train")))  # noqa: E731
+    print(f"Same training manifests: {'yes' if len({train_ids(r) for r in runs}) == 1 else 'no'}")
     print(f"Config settings that differ: {differing or 'none'}")
     other = [k for k in differing if k not in LOADER_KEYS and k != "name"]
     if other:

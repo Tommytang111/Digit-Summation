@@ -91,12 +91,19 @@ class ImageEncoder(nn.Module):
         return self.norm(self.projection(flat))  # [N, D]
 
 
-class DigitSumTransformer(nn.Module):
-    """Classifies the sum of a mixed text/image operand sequence into 9*L + 1 classes."""
+class OperandEncoder(nn.Module):
+    """Operands -> per-operand vectors: shared CNN + token embedding + optional modality embedding +
+    a bidirectional Transformer encoder (no positions here).
+
+    images [B, L, 1, 28, 28], token_ids [B, L], is_image [B, L], padding_mask [B, L]
+      -> embed_operands -> [B, L, D] -> encode -> memory [B, L, D]
+
+    Shared by the main-task classifier (DigitSumTransformer adds sum pooling + a 91-way head) and
+    the length-generalization bonus (bonus_model.SumAnswerModel adds optional positions + a decoder).
+    """
 
     def __init__(
         self,
-        num_classes: int = 91,
         d_model: int = 128,
         nhead: int = 4,
         num_layers: int = 2,
@@ -136,13 +143,6 @@ class DigitSumTransformer(nn.Module):
             ]
         )
         self.final_norm = nn.LayerNorm(d_model) if norm_first else nn.Identity()
-        self.head = nn.Linear(d_model, num_classes)
-        # Zero-init the head. The pooled vector sums L LayerNorm outputs, so its norm is large, and
-        # a randomly initialized head would start with large, overconfident logits (measured
-        # initial loss 9.3 vs ln(91) = 4.51). With zero init, every class starts equally likely.
-        # The head still learns from step one, since dL/dW = (softmax - onehot) * pooled != 0.
-        nn.init.zeros_(self.head.weight)
-        nn.init.zeros_(self.head.bias)
 
     def embed_operands(
         self, images: torch.Tensor, token_ids: torch.Tensor, is_image: torch.Tensor, padding_mask: torch.Tensor
@@ -174,6 +174,25 @@ class DigitSumTransformer(nn.Module):
             hidden = layer(hidden, src_key_padding_mask=padding_mask)
         return self.final_norm(hidden)
 
+class DigitSumTransformer(OperandEncoder):
+    """Classifies the sum of a mixed text/image operand sequence into 9*L + 1 classes.
+
+    OperandEncoder memory [B, L, D] -> masked sum pooling [B, D] -> Linear -> logits [B, num_classes].
+    The encoder modules are attributes of this same module (inherited), so checkpoint keys are
+    the same as before the OperandEncoder refactor (image_encoder.*, token_embedding.*, layers.*, ...).
+    """
+
+    def __init__(self, num_classes: int = 91, **encoder_kwargs):
+        super().__init__(**encoder_kwargs)
+        d_model = encoder_kwargs.get("d_model", 128)
+        self.head = nn.Linear(d_model, num_classes)
+        # Zero-init the head. The pooled vector sums L LayerNorm outputs, so its norm is large, and
+        # a randomly initialized head would start with large, overconfident logits (measured
+        # initial loss 9.3 vs ln(91) = 4.51). With zero init, every class starts equally likely.
+        # The head still learns from step one, since dL/dW = (softmax - onehot) * pooled != 0.
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
     @staticmethod
     def pool(hidden: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
         """Masked sum over operands [B, L, D] -> [B, D].
@@ -196,24 +215,28 @@ class DigitSumTransformer(nn.Module):
         return self.head(pooled)  # [B, num_classes]
 
 
+def operand_encoder_kwargs(model_cfg) -> dict:
+    """ModelConfig -> OperandEncoder keyword arguments (shared by the classifier and the bonus model)."""
+    m = model_cfg
+    return {
+        "d_model": m.d_model,
+        "nhead": m.nhead,
+        "num_layers": m.num_layers,
+        "dim_feedforward": m.dim_feedforward,
+        "dropout": m.dropout,
+        "conv1_channels": m.conv1_channels,
+        "conv2_channels": m.conv2_channels,
+        "cnn_pooling": m.cnn_pooling,
+        "cnn_activation": m.cnn_activation,
+        "cnn_batch_norm": m.cnn_batch_norm,
+        "use_modality_embedding": m.use_modality_embedding,
+        "norm_first": m.norm_first,
+    }
+
+
 def build_model(cfg) -> DigitSumTransformer:
-    """Construct the model from an ExperimentConfig."""
-    m = cfg.model
-    return DigitSumTransformer(
-        num_classes=cfg.num_classes,
-        d_model=m.d_model,
-        nhead=m.nhead,
-        num_layers=m.num_layers,
-        dim_feedforward=m.dim_feedforward,
-        dropout=m.dropout,
-        conv1_channels=m.conv1_channels,
-        conv2_channels=m.conv2_channels,
-        cnn_pooling=m.cnn_pooling,
-        cnn_activation=m.cnn_activation,
-        cnn_batch_norm=m.cnn_batch_norm,
-        use_modality_embedding=m.use_modality_embedding,
-        norm_first=m.norm_first,
-    )
+    """Construct the main-task classifier from an ExperimentConfig."""
+    return DigitSumTransformer(num_classes=cfg.num_classes, **operand_encoder_kwargs(cfg.model))
 
 
 def count_parameters(model: nn.Module) -> dict[str, int]:

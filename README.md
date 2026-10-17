@@ -12,7 +12,10 @@ returns the predicted class as a string, e.g. `"47"`.
 > (GELU, average pooling, no BatchNorm). The defaults have since changed to ReLU + max pooling +
 > BatchNorm, and no sum-model run with the new encoder exists yet. The section
 > [What has actually been run](#what-has-actually-been-run) lists every check and result.
-> The length-generalization bonus is not implemented.
+> **Length-generalization bonus:** implemented (autoregressive answer decoder, lengths 1–10 → 1–20)
+> and verified with tests, structural checks, tiny-overfit checks, and smoke runs. **No full bonus
+> training run exists yet**, so there are no bonus results. See
+> [Length-generalization bonus](#length-generalization-bonus).
 
 ---
 
@@ -32,7 +35,7 @@ returns the predicted class as a string, e.g. `"47"`.
 6. [What has actually been run](#what-has-actually-been-run): checks, training runs, results
 7. [Troubleshooting](#troubleshooting)
 8. [Limitations](#limitations)
-9. [Extending to the bonus](#extending-to-the-length-generalization-bonus)
+9. [Length-generalization bonus](#length-generalization-bonus): decoder, positions, diagnostics, commands, status
 10. [References](#references)
 
 ---
@@ -121,13 +124,23 @@ Digit-Summation/
 ├── train_local.py         thin MPS/CPU entry point
 ├── train_cloud.py         thin single-GPU CUDA entry point
 ├── evaluate.py            explicit checkpoint evaluation (val or test) + diagnostics + figures + W&B eval run
-├── compare_runs.py        tabulates runs; verifies they share pools and eval manifests
-├── tests/                 88 focused tests on synthetic fixtures (no download needed)
+├── compare_runs.py        tabulates runs; verifies they share pools and eval manifests (main and bonus)
+├── bonus_model.py         bonus: sinusoidal positions, SumAnswerModel (3 variants), greedy generation
+├── bonus_data.py          bonus: per-length manifests, MultiLengthDataset, bonus_collate (answer tensors)
+├── bonus_engine.py        bonus: teacher-forced training loop, free-generation scoring, checkpoints
+├── prepare_bonus_data.py  bonus: frozen manifests (train 1-10, val/test 1-20) + leakage audit
+├── inspect_bonus_data.py  bonus: answer tokens, batch contract, sum ranges by length
+├── bonus_checks.py        bonus: shapes | step | overfit | structure
+├── train_bonus_local.py   bonus: thin MPS/CPU entry point
+├── train_bonus_cloud.py   bonus: thin single-GPU CUDA entry point
+├── evaluate_bonus.py      bonus: explicit free-generation evaluation at every length 1-20
+├── configs/bonus_{debug,local,h100}.yaml   bonus configurations (local and h100 mirrored)
+├── tests/                 145 focused tests (88 main task + 57 bonus) on synthetic fixtures
 ├── CNN-encoder-test/      supervised digit-classifier reference for the image encoder: implied
 │                          sum ceiling, encoder variant benchmark (own README and 7 tests)
 ├── requirements.txt       non-torch dependencies pinned to tested versions
 ├── pytest.ini, .gitignore, .env.example (placeholders only)
-├── data/                  (gitignored) MNIST download + data/manifests/{debug,main,full}/
+├── data/                  (gitignored) MNIST download + data/manifests/{debug,main,full,bonus,bonus-debug}/
 ├── runs/                  (gitignored) one directory per run / inspection / overfit check
 └── wandb/                 (gitignored) logs written by the wandb CLI (e.g. `wandb sync`)
 ```
@@ -824,23 +837,298 @@ and is local only.
 - **Elastic distortions** are calibrated by measured displacement but are not a reproduction of
   Simard et al.
 
-## Extending to the length-generalization bonus
+## Length-generalization bonus
 
-The bonus is not implemented. These pieces are already in place for it:
-- Collate pads variable L with a separate `padding_mask`, and the model masks padding in
-  attention and pooling (a test feeds padded slots holding garbage).
-- No positional embeddings and sum pooling make the encoder length-agnostic.
-- The tokenizer already tokenizes multi-digit strings per character (`"42" → [5, 3]`).
-  `encode_operand` deliberately rejects them for the main task.
-- Manifests store L explicitly, and `generate_manifest` takes `sequence_length`.
+**Task:** train on operand sequences of length **1–10** (uniform over lengths) and evaluate at
+**every length 1–20**. The 91-way classifier can't express sums above 90, so the bonus replaces
+its pooling and head with a small **autoregressive character decoder** that writes the sum as
+text: `[BOS] 4 3 [EOS]`. The main-task classifier, its commands, configs, tests, and checkpoints
+are unchanged. Its encoder modules moved into a shared `OperandEncoder` base class, with
+parameter names and outputs verified bit-identical on `full-s0`.
 
-What would change: a 91-way head cannot express sums beyond 90, so the bonus would need an output
-that also generalizes. One example is generating the sum's digit string with a small decoder
-over the same vocabulary, evaluated on held-out lengths.
+**Status:** implemented and verified with bounded checks only (see
+[What has been run](#bonus-what-has-been-run)). **No full bonus training run exists, so there
+are no bonus results yet.**
+
+### Data
+
+`prepare_bonus_data.py` reuses `dataset.generate_manifest` with `sequence_length = L`:
+- uniform digits;
+- an image with probability `data.image_probability` (0.5), chosen independently per position;
+- image operands from the split's own pool;
+- targets from text integers plus MNIST labels.
+
+Labels and sums never enter the model.
+
+| manifests | rows (`bonus_local.yaml`) | images from |
+|---|---|---|
+| `train_L01` … `train_L10` | 10,000 each (100,000 total) | training pool (50,000) |
+| `val_L01` … `val_L20` | 1,000 each | validation pool (10,000) |
+| `test_L01` … `test_L20` | 1,000 each | official MNIST test (10,000) |
+| `{val,test}_all_image_L01` … `L20` | 200 each | same pools, every operand an image |
+
+**Images:** the pools are **the same 50k/10k/10k pools as the main task** (verified identical,
+pool `9e7093ffd649107f`), so test handwriting stays held out.
+
+**All-text overlap policy.** All-text inputs at short lengths *necessarily* repeat across splits:
+length 1 has only 10 possible text inputs, and length 2 has 100 ordered ones. So the bonus does
+not resample them away.
+- The audit (`text_only_duplicates="report"`) still **hard-fails any shared input containing an
+  image between different pools**. All-text overlaps are counted.
+- In the frozen data, every all-text validation row at lengths 1–2 also occurs in training. At
+  length 3 it's 79 of 114, at length 4 it's 6 of 53, and from length 5 on there are none.
+- Evaluation therefore also reports **accuracy on unseen inputs**. It excludes all-text rows whose
+  digits, in any order, occur in training. Lengths 11–20 are unseen by construction.
+- Audit result: **486/486 hard checks passed**.
+
+**Answers beyond training.** Training sums never exceed 90.
+- Sums of 91–99 first appear at length 13.
+- Sums **≥100 (three digits)** first appear at length 15 (2 of 1,000 test rows) and reach
+  232 of 1,000 at length 20.
+
+`inspect_bonus_data.py` prints this per length.
+
+### Tokens, teacher forcing, masks, loss
+
+| | input vocabulary (unchanged) | output vocabulary (new, saved in checkpoints) |
+|---|---|---|
+| special | `PAD = 0` | `PAD = 0`, `BOS = 1`, `EOS = 2` |
+| digits | `"0".."9"` → 1..10 | `"0".."9"` → 3..12 |
+
+**Operands:** each operand is still integer → string → token ID → one vector, or one CNN vector
+per image. A zero operand is token 1, never padding.
+
+**Answers:** canonical decimal, with no leading zeros except `"0"`. Teacher forcing shifts the
+answer by one:
+
+```
+sum 43 -> "43" -> [BOS, "4", "3", EOS]
+decoder input  = [BOS, "4", "3"]      what the decoder has seen so far
+decoder target = ["4", "3", EOS]      the next character at each position
+(a one-digit answer is right-padded: input [BOS, "9", PAD] -> target ["9", EOS, PAD])
+```
+
+| mask (Boolean, True = blocked/padding) | shape | where |
+|---|---|---|
+| `padding_mask` | [B, L] | encoder self-attention keys, decoder cross-attention memory (`memory_key_padding_mask`) |
+| causal `tgt_mask` | [T, T] | decoder self-attention: position t sees only positions ≤ t |
+| `decoder_padding_mask` | [B, T] | decoder self-attention keys at padded answer positions |
+| target padding | [B, T] | `cross_entropy(ignore_index=PAD)` |
+
+**Loss:** cross-entropy **averaged over valid (non-pad) target tokens in the batch**. A two-digit
+answer contributes 3 tokens and a one-digit answer 2. Teacher-forced loss (`train/loss`,
+`val/loss`) is never reported as accuracy.
+
+### Model and the three variants
+
+```
+operands -> OperandEncoder.embed_operands -> [B,L,D]         one vector per operand (CNN or token embedding + modality)
+         -> + sinusoidal position p for slot p                (variants with encoder positions; across the mixed sequence)
+         -> bidirectional Transformer encoder (2 layers)     -> memory [B,L,D]
+[BOS, d1, ...] -> answer embedding + sinusoidal positions (0 = BOS)
+         -> 2 x TransformerDecoderLayer (4 heads, ff 512, pre-LN): causal self-attention + cross-attention to all of memory
+         -> LayerNorm [-> + Linear(0.1 * masked sum of memory): ablation only] -> Linear -> logits [B,T,13]
+```
+
+| `bonus.architecture` | operand positions | decoder reads | parameters |
+|---|---|---|---|
+| `items_only_sinusoidal` (**primary**) | sinusoidal | encoder items only | 1,351,917 |
+| `items_only_no_positions` | none | encoder items only | 1,351,917 |
+| `sinusoidal_plus_sum_summary` (ablation) | sinusoidal | items + summary added before the head | 1,368,429 (+16,512) |
+
+The summary layer is built last. Under the same seed, every shared parameter therefore starts
+identical across variants; a test checks this.
+
+**Sinusoidal positions.** Position p maps to `[sin(p/10000^(2i/D)), cos(p/10000^(2i/D))]`.
+- This is a fixed function, not a learned table, so positions 11–20 (and output positions never
+  seen in training) still get distinct, bounded vectors.
+- That makes longer positions *distinguishable*. **It does not make the model count, add, or
+  generalize**; those must be learned.
+- Positions are computed on demand in float32, then cast to the input's dtype and device. They
+  are prefix-consistent: positions 0–9 are the same whether 10 or 20 are requested.
+
+**Why positions on operands at all, if addition is order-invariant?** It's a tradeoff:
+- **Without positions:** the model is *exactly* permutation-invariant, matching the task.
+  Softmax attention, however, takes weighted *averages*, so identical items can't be counted
+  (see below).
+- **With positions:** every slot is distinct, which makes counting possible. The cost is that the
+  model is now order-sensitive, and permutation consistency has to be learned. Evaluation
+  measures it.
+
+**RoPE and ALiBi** (not implemented here) put position information inside attention:
+- RoPE rotates queries and keys by position, so attention depends on relative offsets.
+- ALiBi adds a distance-proportional bias to attention scores.
+
+Both are popular for length extrapolation because they encode *relative* rather than absolute
+positions. They're the natural next comparison once this simplest variant has been measured.
+
+**The repeated-operand limitation of `items_only_no_positions`.** With identical operand vectors,
+no positions, no count feature, and ordinary softmax attention, `[3]`, `[3,3]` and `[3,3,3]`
+produce **identical** encoder outputs and decoder distributions. Each attention step averages
+copies of the same vector.
+- This was verified before any claim was made. With the actual architecture, next-token
+  distributions for `[3]` vs `[3]×k` (k up to 20) agree to **3e-8** untrained, and still to
+  **9e-8** after training.
+- A reordered, tripled `[2,1,2,1,1,2]` also matches `[1,2]` (~5e-7).
+- **More training cannot fix this.** In the tiny-overfit check, this variant fit 63 of 64 rows.
+  The one it couldn't fit was `[7,7]` → 14, because the same fixed set also contained `[7]` → 7,
+  which it sees as identical.
+- Handwritten images of the same digit are *not* identical vectors, so image repeats are only
+  near-identical. The diagnostic reports text and image repeats separately.
+
+**The sum-summary ablation** adds `Linear(0.1 · Σ_valid memory_i)` to every decoder state after the
+final LayerNorm, just before the vocabulary head.
+- A sum (unlike attention's average) grows with the number of operands. Nothing normalizes it
+  afterward, which would erase that.
+- The 0.1 is a fixed scale, identical at every length.
+- It sums *learned features*, not digit labels or the target. That makes it an additive
+  architectural bias, the same one the main classifier's sum pooling provides, and not a
+  programmed arithmetic solver.
+
+### Generation
+
+Greedy decoding starts from `BOS` and feeds the model's own previous predictions.
+- The cap is `bonus.max_new_tokens = 4`: three digits plus EOS (sums up to 180). There is no
+  two-digit limit.
+- Completion is tracked per row; a finished row is padded after its EOS.
+- There is **no special-token suppression**. An emitted PAD/BOS counts as invalid.
+- Output status: `valid`, `missing_eos` (cap reached: an explicit failure), `empty`,
+  `special_token`, or `leading_zero`.
+- No answer is computed in code at inference.
+
+### Training and checkpoint selection
+
+`train_bonus_local.py` and `train_bonus_cloud.py` share `bonus_engine.run_bonus_training`, which
+reuses the main engine's helpers: devices, seeding, per-(epoch, row) augmentation, optimizer,
+scheduler, early stopping, resume, logging, and W&B.
+- Training uses teacher forcing. Augmentation applies to training rows only.
+- **Selection rule** (recorded in every checkpoint and `summary.json`): best **free-generation
+  exact-answer accuracy on validation lengths 1–10**, ties broken by lower teacher-forced
+  validation loss. Early stopping uses the same metric.
+- **Lengths 11–20 are never evaluated during training.** Run `evaluate_bonus.py` for them, and
+  don't tune repeatedly against them. Any development use of lengths 11–20 should be disclosed.
+- Checkpoints store: model, optimizer, scheduler, config (architecture and positional settings),
+  both vocabularies, `task = "bonus_decoder"`, data IDs, train state, and RNG.
+  - Main and bonus loaders refuse each other's checkpoints.
+  - Loading goes through the CPU first, so a checkpoint loads on any device.
+
+### Evaluation (`evaluate_bonus.py --split val|test`)
+
+Everything is free generation, reported with sample counts:
+- **Per length 1–20:** exact full-answer accuracy, unseen-input accuracy, invalid and missing-EOS
+  rates, and MAE on valid outputs (with that denominator). Also teacher-forced loss, plus sum
+  groups **≤90 / 91–99 / ≥100**, per length and pooled over extrapolation lengths.
+- **By image fraction:** results by the fraction of operands that are images, for trained vs
+  extrapolation lengths.
+- **Recognition vs arithmetic:**
+  - **ORACLE** substitution: images replaced by their true digit strings through the normal
+    tokenizer. It uses labels, and it changes the modality mix, since every row becomes
+    all-text.
+  - all-image sets; text-only and mixed natural rows;
+  - an analytic reference `(1 − q + q·p)^L`. Here p is the CNN-encoder-test per-image accuracy
+    for this encoder, and the formula is labeled as a reference, not a result.
+- **Structural tests** (a correct implementation must pass, no learning involved):
+  - extra right padding leaves outputs unchanged;
+  - `items_only_no_positions` gives identical repeated-operand distributions;
+  - the same operand gets different representations at different positions.
+- **Learned tests** (correctness must be learned; these are measurements):
+  - permutation consistency (shuffled operands, same sum);
+  - `[d]×k` for k = 1..20, as text and as images;
+  - repeated zeros → `"0"`;
+  - appending a real zero (text or image) leaves the answer unchanged.
+- **Galleries:** seeded examples at lengths 1/5/10/11/15/20, and a separate failure gallery.
+
+**How to read extrapolation.** Three difficulties are mixed together, and they're distinct:
+1. **Longer inputs:** more operands to aggregate, plus positions the encoder never saw.
+2. **Larger sums:** 91–99 are still two digits, but the decoder never wrote them.
+3. **Three-digit answers:** ≥100 needs a third digit, and an EOS at an output position never
+   trained.
+
+Sum groups condition on the total, which also changes the operands: sums ≥100 at a given length
+are made of larger digits. They separate these difficulties only partly. Finally, the model
+*accepting* length-20 inputs is implementation support (padding masks, positions on demand).
+**Whether it generalizes is only what the per-length numbers show.**
+
+### Commands
+
+```bash
+PY=../.torch/bin/python
+# Data (frozen; re-running verifies) + inspection
+$PY prepare_bonus_data.py --config configs/bonus_local.yaml
+$PY inspect_bonus_data.py --config configs/bonus_local.yaml           # -> runs/inspect-bonus-local/
+# Tests (bonus only, ~2 s) and the whole suite
+$PY -m pytest tests/test_bonus_tokenizer.py tests/test_bonus_model.py tests/test_bonus_data.py tests/test_bonus_engine.py
+$PY -m pytest
+# Checks on the tiny debug data
+$PY prepare_bonus_data.py --config configs/bonus_debug.yaml
+$PY bonus_checks.py shapes    --config configs/bonus_debug.yaml
+$PY bonus_checks.py structure --config configs/bonus_debug.yaml
+$PY bonus_checks.py step      --config configs/bonus_debug.yaml
+$PY bonus_checks.py overfit   --config configs/bonus_debug.yaml        # <= 300 updates; --max-steps N to change
+$PY bonus_checks.py overfit   --config configs/bonus_debug.yaml --set bonus.architecture=items_only_no_positions
+# Smoke run (pipeline check only)
+$PY train_bonus_local.py --config configs/bonus_debug.yaml --set logging.run_name=bonus-smoke
+$PY evaluate_bonus.py --checkpoint runs/bonus-smoke/checkpoints/best.pt --split val
+# Primary local experiment (explicit; not run yet)
+$PY train_bonus_local.py --config configs/bonus_local.yaml --set logging.run_name=bonus-sinusoidal-s0
+$PY evaluate_bonus.py --checkpoint runs/bonus-sinusoidal-s0/checkpoints/best.pt --split val
+# Controlled comparisons: identical data, budget, augmentation, evaluation; only the architecture changes
+$PY train_bonus_local.py --config configs/bonus_local.yaml --set bonus.architecture=items_only_no_positions     --set logging.run_name=bonus-nopos-s0
+$PY train_bonus_local.py --config configs/bonus_local.yaml --set bonus.architecture=sinusoidal_plus_sum_summary --set logging.run_name=bonus-sumsummary-s0
+$PY compare_runs.py runs/bonus-sinusoidal-s0 runs/bonus-nopos-s0 runs/bonus-sumsummary-s0
+# Final test numbers, once, for the selected checkpoints
+$PY evaluate_bonus.py --checkpoint runs/bonus-sinusoidal-s0/checkpoints/best.pt --split test
+# H100: copy the project with data/manifests/bonus, install CUDA torch (see Setup), then
+$PY prepare_bonus_data.py --config configs/bonus_h100.yaml               # downloads MNIST, VERIFIES the copied manifests
+$PY train_bonus_cloud.py  --config configs/bonus_h100.yaml --set logging.run_name=bonus-h100-sinusoidal-s0
+$PY train_bonus_cloud.py  --config configs/bonus_h100.yaml --set train.amp_dtype=bf16 --set logging.run_name=bonus-h100-bf16-s0   # optional
+```
+
+**Expected time:** a rough estimate for the 100-epoch local run (39,000 updates) is about an hour
+on the M4 Pro; it hasn't been measured. On debug batches, MPS model steps ran at about 4,800 seq/s
+once tensor shapes had been seen, but only **462 seq/s while MPS compiles kernels for new
+shapes**. Variable lengths create many shapes, so the first minutes are slow.
+
+### Bonus: what has been run
+
+| check | outcome |
+|---|---|
+| main-task regression | `full-s0` loads strictly after the `OperandEncoder` refactor, with **bit-identical logits** and identical parameter names. `evaluate.py --split val` reproduces 0.9587 accuracy and 0.7663 macro F1 |
+| `pytest` | **145 passed**: 88 main task + 57 bonus (tokens and the teacher-forcing shift; positions: shape/dtype/MPS/prefix consistency; causal, operand-padding, and decoder-padding masks; loss masking and normalization; gradients for all variants; scripted generation incl. three digits / EOS / missing EOS / per-row stopping; count-blindness; position distinctness; sum-summary count sensitivity; parameter and init parity; manifests, audit policy, multi-length dataset, collate; checkpoint round trip and cross-task guards, incl. MPS load; end-to-end train + resume; validation never touches lengths > 10) |
+| `prepare_bonus_data` debug + full | debug and full manifests frozen. Full: 90 manifests, 7.3 MB, pools identical to the main task, **audit 486/486** |
+| `inspect_bonus_data` (debug) | answer tokens, teacher-forcing shift, and padded batch contract as shown above |
+| `bonus_checks shapes` / `step` | all three variants: every boundary as diagrammed. Finite, non-zero gradients in every component; output-PAD row gradient 0; initial teacher-forced loss 2.72–2.80 (ln 13 = 2.56) |
+| `bonus_checks structure` (untrained) | padding: **0** max logit difference for all variants. Repeated `[3]×k`: no-positions **3e-8**, sinusoidal 1.5e-2, sum summary 0.26. Same operand across positions: no-positions 0, sinusoidal 1.26 |
+| tiny overfit (64 fixed rows, lengths 1–10, aug + dropout off, cap 300) | `items_only_sinusoidal` **passed at update 50**. `sinusoidal_plus_sum_summary` **passed at 80**. `items_only_no_positions` **63/64 after 300**: the unfit row `[7,7]`→14 is indistinguishable from `[7]`→7 in the same set, the structural limit above, not a bug |
+| smoke runs (debug, 60 updates) + `evaluate_bonus --split val` | all three variants run end to end (checkpoints, curves, every report section, galleries). Accuracies of ~5–8% at lengths 1–10 are **pipeline checks, not results**. `compare_runs.py` on the three smoke runs: controlled comparison YES, the only differing setting is `bonus.architecture`. Smoke throughput was 250–1,200 seq/s (MPS shape warm-up dominates 60-update runs) |
+
+**Not run yet:**
+- any full bonus training;
+- bonus test-split evaluation of a real model;
+- the controlled three-variant comparison and seed repeats;
+- H100 / bf16 runs.
+
+### Bonus limitations and next steps
+
+- **No results yet.** Every claim about extrapolation awaits the commands above.
+- **Order sensitivity:** the primary model must *learn* to ignore operand order, so watch
+  permutation consistency.
+- **Three-digit answers** need behavior never trained: a third digit, then EOS at a new output
+  position. Expect this to be the hardest group. A strict experiment never adds such training
+  targets.
+- **All-text overlap** at short lengths is unavoidable. Use the unseen-input columns.
+- **Training speed:** shape-varying batches are slow on MPS until kernels are cached. Padding
+  every batch to the maximum training length is a possible speed fix that wasn't needed for
+  correctness.
+- **Next comparisons** after the primary run: the two ablations (same budget), multiple seeds,
+  then RoPE or ALiBi as a single additional positional method.
 
 ## References
 
 - Y. LeCun, L. Bottou, Y. Bengio, P. Haffner. *Gradient-Based Learning Applied to Document Recognition.* Proc. IEEE 86(11), 1998. (MNIST; affine distortions)
 - P. Y. Simard, D. Steinkraus, J. C. Platt. *Best Practices for Convolutional Neural Networks Applied to Visual Document Analysis.* ICDAR 2003. (elastic distortions)
 - A. Buslaev et al. *Albumentations: Fast and Flexible Image Augmentations.* Information 11(2):125, 2020.
-- torchvision `datasets.MNIST`; PyTorch `nn.TransformerEncoderLayer` / `torch.load(weights_only=True)` documentation.
+- A. Vaswani et al. *Attention Is All You Need.* NeurIPS 2017. (sinusoidal positional encoding)
+- J. Su et al. *RoFormer: Enhanced Transformer with Rotary Position Embedding.* 2021. (RoPE)
+- O. Press, N. A. Smith, M. Lewis. *Train Short, Test Long: Attention with Linear Biases Enables Input Length Extrapolation.* ICLR 2022. (ALiBi)
+- torchvision `datasets.MNIST`; PyTorch `nn.TransformerEncoderLayer` / `nn.TransformerDecoderLayer` / `torch.load(weights_only=True)` documentation.
