@@ -2,14 +2,22 @@
 
     python evaluate.py --checkpoint runs/<run>/checkpoints/best.pt --split val
     python evaluate.py --checkpoint runs/<run>/checkpoints/best.pt --split test
+    python evaluate.py --checkpoint runs/<run>/checkpoints/best.pt --split test --wandb-mode offline
 
 Writes to <run>/eval_<split>_<checkpoint>/:
-    metrics.json      main metrics, breakdowns (with n), baseline, diagnostics, stress cases
-    predictions.csv   one row per sequence; answers as text
-    examples.png      seeded random rows (successes and failures alike)
-    failures.png      seeded random rows among the errors only
-    breakdown.png     accuracy by image count and by sum range
-    stress.png        all-zero / all-nine stress inputs (kept apart from natural results)
+    metrics.json         main metrics, breakdowns (with n), baseline, diagnostics, stress cases
+    predictions.csv      one row per sequence; answers as text
+    metrics_summary.png  accuracy, macro F1, and MAE next to the majority baseline
+    examples.png         seeded random rows (successes and failures alike)
+    failures.png         seeded random rows among the errors only
+    breakdown.png        accuracy by image count and by sum range
+    stress.png           all-zero / all-nine stress inputs (kept apart from natural results)
+
+W&B: unless the mode is "disabled" (by default the checkpoint's logging.wandb_mode; override with
+--wandb-mode), the evaluation is logged as its own W&B run, "<run>-eval_<split>_<checkpoint>",
+in the training run's group. Every number in metrics.json goes to its summary under
+"<split>/..." (e.g. test/accuracy, test/majority_baseline/accuracy, test/by_image_count/5/accuracy),
+and the figures are logged as images.
 
 Report sections, kept separate on purpose:
     main         naturally sampled sequences of the split (the headline number)
@@ -22,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -30,8 +39,10 @@ import numpy as np
 
 import visualization as viz
 from augmentations import build_transform
+from config import config_to_dict
 from dataset import SequenceManifest, compute_targets, load_prepared_data
 from engine import EvalOutput, evaluate, load_model_from_checkpoint, macro_f1, make_loader, resolve_device
+from experiment_logging import flatten_metrics, log_evaluation
 from tokenizer import class_id_to_text, number_to_string
 
 
@@ -92,12 +103,37 @@ def operand_string(manifest: SequenceManifest, row: int) -> str:
     return " ".join(parts)
 
 
+def log_to_wandb(metrics: dict, figures: dict[str, Path], cfg, checkpoint_path: Path, out: Path, wandb_mode: str | None) -> None:
+    """Log this evaluation as its own W&B run in the training run's group (no-op when disabled).
+
+    Every number in `metrics` goes to the run summary under "<split>/...", and `figures` are logged
+    as images under "<split>/<name>".
+    """
+    split = metrics["split"]
+    run_name = checkpoint_path.resolve().parent.parent.name  # runs/<run>/checkpoints/best.pt -> <run>
+    logging_cfg = cfg.logging if wandb_mode is None else dataclasses.replace(cfg.logging, wandb_mode=wandb_mode)
+    scalars = {**metrics["main"], **{key: metrics[key] for key in ("majority_baseline", "diagnostics", "stress_cases")}}
+    evaluation = {"checkpoint": str(checkpoint_path), "split": split, "optimizer_step": metrics["optimizer_step"]}
+    log_evaluation(
+        logging_cfg,
+        run_config={**config_to_dict(cfg), "evaluation": evaluation},
+        summary={**flatten_metrics(scalars, prefix=split), "optimizer_step": metrics["optimizer_step"]},
+        images={f"{split}/{name}": path for name, path in figures.items()},
+        name=f"{run_name}-{out.name}",
+        group=run_name,
+        directory=out,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--split", required=True, choices=["val", "test"])
     parser.add_argument("--device", default="auto", choices=["auto", "mps", "cpu", "cuda"])
     parser.add_argument("--out", default=None)
+    parser.add_argument(
+        "--wandb-mode", default=None, choices=["disabled", "offline", "online"], help="overrides the checkpoint's logging.wandb_mode"
+    )
     args = parser.parse_args()
 
     device = resolve_device(args.device)
@@ -212,6 +248,13 @@ def main() -> int:
         f"{args.split}: failure gallery, {len(picked)} random of {len(failures)} errors",
     )
     viz.plot_breakdown(by_images, by_range, out / "breakdown.png", f"{args.split}: accuracy breakdown (n per bar)")
+    viz.plot_metric_summary(
+        metrics["main"],
+        baseline,
+        args.split,
+        out / "metrics_summary.png",
+        f"{args.split}: model vs. majority baseline (step {train_state['global_step']:,}, n = {main_result.num_examples:,})",
+    )
     viz.plot_sequence_gallery(stress_rows, out / "stress.png", "Stress cases (constructed; not part of the natural results)")
 
     print(f"\n== {args.split} (naturally sampled) ==")
@@ -230,6 +273,8 @@ def main() -> int:
         print(f"{name:>14}: target {s['target']:>2}  acc {s['accuracy']:.2f}  (n={s['n']}, predictions {s['predictions_seen']})")
     example = int(main_result.indices[0])
     print(f"\nexample answer: operands {operand_string(manifest, example)} -> \"{class_id_to_text(int(main_result.predictions[0]))}\" (target {int(main_result.targets[0])})")
+    figures = {name: out / f"{name}.png" for name in ("metrics_summary", "breakdown", "examples", "failures", "stress")}
+    log_to_wandb(metrics, figures, cfg, checkpoint_path, out, args.wandb_mode)
     print(f"Wrote {out}")
     return 0
 

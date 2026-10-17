@@ -2,7 +2,9 @@
 
 Style: light chart surface, recessive hairline grid, 2px lines, fixed series colors per split
 (train=blue, val=orange, test=aqua; validated as a CVD-safe set). Legends are shown for every
-multi-series chart, and correctness is marked with a ✓/✗ glyph, not by color alone.
+multi-series chart, and correctness is marked with a ✓/✗ glyph, not by color alone. Baselines
+drawn next to a split's color use the light BASELINE gray: the darker INK_MUTED gray is too
+close to the test aqua under deuteranopia (validated).
 """
 
 from __future__ import annotations
@@ -270,6 +272,45 @@ def plot_breakdown(by_image_count: list[dict], by_sum_range: list[dict], path: P
         ax.set_xlabel(label)
         ax.set_ylabel("Exact-sum accuracy")
         _style(ax)
+    fig.suptitle(title, color=INK, fontsize=12, x=0.01, ha="left")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+def plot_metric_summary(main: dict, baseline: dict, split: str, path: Path, title: str) -> Path:
+    """Headline metrics of the model next to the majority baseline: one panel per metric.
+
+    Accuracy and macro F1 are fractions (higher is better); MAE is in units of the sum (lower is
+    better). Their scales differ, so each metric gets its own axis instead of sharing one. The
+    model bar uses the split's series color and the baseline a recessive gray; both are named on
+    the axis and labeled with their value, so color is never the only cue.
+    """
+    panels = [
+        ("accuracy", "Exact-sum accuracy (higher is better)", 1.0),
+        ("macro_f1", "Macro F1 (higher is better)", 1.0),
+        ("mae", "Mean absolute error, in units of the sum (lower is better)", None),
+    ]
+    # Evaluations made before macro F1 existed have no such value; skip panels with no data.
+    panels = [(key, label, limit) for key, label, limit in panels if main.get(key) is not None]
+    names = ["model", f'always "{baseline["answer"]}" (baseline)']
+    colors = [SERIES.get(split, SERIES["test"]), BASELINE]
+    fig, axes = plt.subplots(len(panels), 1, figsize=(8, 1.55 * len(panels) + 0.4), squeeze=False)
+    for ax, (key, label, limit) in zip(axes[:, 0], panels):
+        values = [main[key], baseline[key]]
+        upper = 1.15 * (limit if limit is not None else max(values))
+        ax.barh([1, 0], values, height=0.5, color=colors)  # model on top
+        for y, value in zip([1, 0], values):
+            ax.text(value + 0.01 * upper, y, f"{value:.3f}", va="center", fontsize=9, color=INK_SECONDARY)
+        ax.set_yticks([1, 0], names, fontsize=9, color=INK_SECONDARY)
+        ax.set_xlim(0, upper)
+        if limit is not None:
+            ax.set_xticks([0, 0.25, 0.5, 0.75, 1.0])
+        ax.set_title(label, loc="left", fontsize=10)
+        ax.tick_params(axis="both", length=0)
+        for side in ("top", "right", "left"):
+            ax.spines[side].set_visible(False)
+        ax.grid(axis="x", color=GRID, linewidth=0.6)
+        ax.set_axisbelow(True)
     fig.suptitle(title, color=INK, fontsize=12, x=0.01, ha="left")
     fig.tight_layout()
     return _save(fig, path)

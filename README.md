@@ -5,11 +5,13 @@ Each example is a sequence of **ten operands**. Each position is independently e
 token embeddings + 2-layer Transformer encoder) classifies the sum into **91 classes (0–90)** and
 returns the predicted class as a string, e.g. `"47"`.
 
-> **Status (2026-10-15).** The main-task pipeline is implemented and verified: unit tests, data
-> inspection, leakage audit, shape and gradient checks, and a bounded tiny-overfit check. A
-> 60-step debug run exercised training → checkpoint → evaluation end to end. **No full training
-> run has been done**, so this README reports **no trained-model accuracy**. The section
-> [What has actually been run](#what-has-actually-been-run) lists every check and its outcome.
+> **Status (2026-10-16).** The main-task pipeline is implemented and verified: unit tests, data
+> inspection, leakage audit, shape and gradient checks, and a bounded tiny-overfit check. One
+> full training run on the 100,000-sequence data (`full-s0`, a single seed) reached **95.87%
+> validation** and **95.50% test** exact-sum accuracy. That run used the *original* image encoder
+> (GELU, average pooling, no BatchNorm). The defaults have since changed to ReLU + max pooling +
+> BatchNorm, and no sum-model run with the new encoder exists yet. The section
+> [What has actually been run](#what-has-actually-been-run) lists every check and result.
 > The length-generalization bonus is not implemented.
 
 ---
@@ -27,7 +29,7 @@ returns the predicted class as a string, e.g. `"47"`.
    - [Evaluation and diagnostics](#6-evaluation)
    - [Logging and Weights & Biases](#7-logging-and-weights--biases)
 5. [Experiments to run next](#experiments-to-run-next)
-6. [What has actually been run](#what-has-actually-been-run)
+6. [What has actually been run](#what-has-actually-been-run): checks, training runs, results
 7. [Troubleshooting](#troubleshooting)
 8. [Limitations](#limitations)
 9. [Extending to the bonus](#extending-to-the-length-generalization-bonus)
@@ -54,10 +56,14 @@ $PY prepare_data.py --config configs/debug.yaml --audit-only        # re-audit w
 
 # 3. Inspect raw + augmented examples, tokenization, targets, distributions
 $PY inspect_data.py --config configs/debug.yaml                     # -> runs/inspect-debug/
+$PY inspect_data.py --config configs/local.yaml --rows 16           # full data -> runs/inspect-local/
+#    options: --config (required), --set KEY=VALUE, --out DIR, --rows N (default 8; rows are
+#    drawn with a fixed seed from the whole training manifest, so every run shows the same rows)
 
 # 4. Test the dataset and collate function in isolation (synthetic data, no download)
 $PY -m pytest tests/test_dataset.py tests/test_tokenizer.py
-$PY -m pytest                                                       # whole suite (~15 s)
+$PY -m pytest                                                       # whole suite (88 tests, ~40 s)
+$PY -m pytest CNN-encoder-test                                      # the encoder benchmark's own 7 tests
 
 # 5. Image encoder / token embedding / Transformer shape checks
 $PY sanity_checks.py shapes
@@ -73,13 +79,15 @@ $PY sanity_checks.py overfit --config configs/debug.yaml --set overfit.image_pro
 $PY train_local.py --config configs/debug.yaml --set logging.run_name=debug-short
 $PY evaluate.py --checkpoint runs/debug-short/checkpoints/best.pt --split val
 
-# 9. Full local experiment (explicit; ~12.5k optimizer updates)
+# 9. Full local experiment (explicit; up to 78,000 optimizer updates, early stopping may end it
+#    sooner; full-s0 took ~51 min on the M4 Pro with the previous encoder). local.yaml logs to W&B
+#    online: run `wandb login` first, or add --set logging.wandb_mode=offline
 $PY prepare_data.py --config configs/local.yaml                     # already built; verifies frozen manifests
-$PY train_local.py  --config configs/local.yaml --set logging.run_name=local-affine-s0
+$PY train_local.py  --config configs/local.yaml --set logging.run_name=full-affine-s0
 
 # 10. Evaluate the validation-selected checkpoint and generate deliverables
-$PY evaluate.py --checkpoint runs/local-affine-s0/checkpoints/best.pt --split val
-$PY evaluate.py --checkpoint runs/local-affine-s0/checkpoints/best.pt --split test   # final number, once
+$PY evaluate.py --checkpoint runs/full-affine-s0/checkpoints/best.pt --split val
+$PY evaluate.py --checkpoint runs/full-affine-s0/checkpoints/best.pt --split test   # final number, once
 
 # 11. Same project/config/manifests on an H100 (see "Running on an H100")
 rsync -av --exclude runs --exclude data/MNIST ./ user@h100-host:~/Digit-Summation/
@@ -97,8 +105,9 @@ Digit-Summation/
 ├── config.py              typed dataclass config; YAML loading; unknown-key rejection; --set overrides
 ├── configs/
 │   ├── debug.yaml         5% source subsets, 2000/500/500 sequences, <=60 updates, W&B disabled
-│   ├── local.yaml         full data, 20000/2000/5000 sequences, MPS float32, batch 64, 40 epochs
-│   └── h100.yaml          identical data + optimization to local.yaml, on CUDA with 8 workers
+│   ├── local.yaml         full data (data/manifests/full), 100000/20000/20000 sequences, MPS float32,
+│   │                      batch 256, 200 epochs, warmup + cosine, early stopping, W&B online
+│   └── h100.yaml          identical data + optimization to local.yaml, on CUDA with 8 workers + pinned memory
 ├── tokenizer.py           fixed vocabulary: PAD=0, "0".."9" -> 1..10; integer -> string -> token IDs
 ├── dataset.py             MNIST arrays, hashing, source pools, manifests, DigitSumDataset, collate_batch
 ├── augmentations.py       Albumentations pipelines (none / affine / affine_elastic), worker seeding
@@ -111,13 +120,16 @@ Digit-Summation/
 ├── sanity_checks.py       env | shapes | step | overfit
 ├── train_local.py         thin MPS/CPU entry point
 ├── train_cloud.py         thin single-GPU CUDA entry point
-├── evaluate.py            explicit checkpoint evaluation (val or test) + diagnostics + galleries
+├── evaluate.py            explicit checkpoint evaluation (val or test) + diagnostics + figures + W&B eval run
 ├── compare_runs.py        tabulates runs; verifies they share pools and eval manifests
-├── tests/                 85 focused tests on synthetic fixtures (no download needed)
+├── tests/                 88 focused tests on synthetic fixtures (no download needed)
+├── CNN-encoder-test/      supervised digit-classifier reference for the image encoder: implied
+│                          sum ceiling, encoder variant benchmark (own README and 7 tests)
 ├── requirements.txt       non-torch dependencies pinned to tested versions
 ├── pytest.ini, .gitignore, .env.example (placeholders only)
-├── data/                  (gitignored) MNIST download + data/manifests/{debug,main}/
-└── runs/                  (gitignored) one directory per run / inspection / overfit check
+├── data/                  (gitignored) MNIST download + data/manifests/{debug,main,full}/
+├── runs/                  (gitignored) one directory per run / inspection / overfit check
+└── wandb/                 (gitignored) logs written by the wandb CLI (e.g. `wandb sync`)
 ```
 
 ---
@@ -159,10 +171,19 @@ package. Every API call used here (`Affine(fill=...)`, `ElasticTransform(noise_d
 ### 1. Data: source pools and manifests
 
 ```
-official MNIST train (60,000) ─┬─ exact-duplicate resolution ─┬─ train pool (50,000) ─ train manifest (20,000 seq)
-                               │                              └─ val pool   (10,000) ─ val manifest   (2,000 seq)
-official MNIST test (10,000) ──┴──────────────────────────────── test pool  (10,000) ─ test manifest  (5,000 seq)
+official MNIST train (60,000) ─┬─ exact-duplicate resolution ─┬─ train pool (50,000) ─ train manifest (100,000 seq)
+                               │                              └─ val pool   (10,000) ─ val manifest   (20,000 seq)
+official MNIST test (10,000) ──┴──────────────────────────────── test pool  (10,000) ─ test manifest  (20,000 seq)
 ```
+
+Sequence counts are those of `configs/local.yaml` and `configs/h100.yaml`. Three manifest sets
+exist on disk, each with its own leakage audit:
+
+| directory | train / val / test sequences | source pools | used by |
+|---|---|---|---|
+| `data/manifests/debug` | 2,000 / 500 / 500 | 5% subsets (2,500 / 500 / 501 images) | `debug.yaml` |
+| `data/manifests/main` | 20,000 / 2,000 / 5,000 | full | the earlier 20k runs (`local-affine-s0`, `local-20261015-*`); no current config |
+| `data/manifests/full` | 100,000 / 20,000 / 20,000 | full | `local.yaml`, `h100.yaml`, `full-s0`, `CNN-encoder-test/` |
 
 **Source pools come first, and arithmetic examples come only after the pools are isolated.**
 `build_source_pools` hashes every raw image (SHA-256 of its 784 bytes) and resolves exact
@@ -201,8 +222,8 @@ Generation follows the assignment's order. For each operand:
 
 The target is then computed from the text integers plus the **MNIST labels** looked up via
 `source_index`, and the generator asserts that each image's label equals the sampled digit. The
-full config's 20k/2k/5k manifests take 2.4 MB, and the dataset fetches and transforms pixels lazily
-on access.
+full manifests (100k/20k/20k plus diagnostic sets) take 9.1 MB, and the dataset fetches and
+transforms pixels lazily on access.
 
 **Frozen evaluation data.** Every manifest has its own recorded seed (train 1001, val 2002,
 test 3003, diagnostics derived from 4004) and a content ID. Re-running `prepare_data.py`
@@ -212,23 +233,25 @@ pool and manifest IDs, and `evaluate.py` refuses to evaluate against different d
 generated in the order test → val → train. A row whose input already exists in an earlier
 manifest is *resampled*, which keeps test fixed and adjusts train instead.
 
-**Why more sequences ≠ more handwriting.** Every image operand comes from a fixed pool. The 20,000
-training sequences contain ~100k image slots but use only **43,269 distinct training images**
-(2.32 uses each). The other ~13.5% of the 50k pool is never used, which matches the Poisson
-expectation e^−2. Raising the sequence count to 200k would reuse each image ~20× and create new
-*combinations and sums*, but no new independent handwriting. Image diversity is controlled by the
-**source fraction**, not by the sequence count.
+**Why more sequences ≠ more handwriting.** Every image operand comes from a fixed pool. The
+20,000-sequence `main` manifest has ~100k image slots but uses only **43,269 distinct training
+images** (2.32 uses each). The other ~13.5% of the 50k pool is never used, which matches the
+Poisson expectation e^−2. The 100,000-sequence `full` manifest has ~500k image slots and uses
+**49,997 of the 50,000** images, about 10 times each. Going from 20k to 100k sequences therefore
+added new *combinations and sums* and the last ~13% of the pool, but no other new handwriting.
+Image diversity is controlled by the **source fraction**, not by the sequence count.
 
 **Target distribution is not uniform.** A sum of 10 uniform digits has an exact,
 bell-shaped distribution (computed by convolution in `inspect_data.py`). It peaks at **45 with
-p = 0.0432**, while P(sum ∈ {0, 90}) = 2.0 × 10⁻¹⁰. The 20k training manifest has its majority at
-45 (4.62%), and **24 classes never occur in it at all** (0–10, 77–80, 82–90). See
-`runs/inspect-local/distributions.png`, which also shows the image-count distribution against
-Binomial(10, 0.5).
+p = 0.0432**, while P(sum ∈ {0, 90}) = 2.0 × 10⁻¹⁰. The 100k training manifest has its majority
+at 45 (4.36%), and **18 classes never occur in it at all** (0–9 and 83–90). For the 20k `main`
+manifest these were 45 (4.62%) and 24 classes. `inspect_data.py --config configs/local.yaml`
+writes `runs/inspect-local/distributions.png`, which also shows the image-count distribution
+against Binomial(10, 0.5).
 
 #### Leakage audit (`prepare_data.py`, executable, exit code 1 on failure)
 
-Hard checks (**76/76 pass** for both the debug and main data):
+Hard checks (**76/76 pass** for the debug, main, and full data):
 - Source pools are disjoint as (partition, index) IDs.
 - Every manifest's image operands come from its own split's pool, and text slots have no image source.
 - No exact raw-pixel hash is shared between pools.
@@ -240,9 +263,9 @@ Hard checks (**76/76 pass** for both the debug and main data):
 
 Reused digit values and reused target sums across splits are **legitimate** and are reported as
 such, not flagged. **All-text rows** are the only rows that *can* collide across splits, since
-they contain no images. The main manifests contain 20 (train), 1 (val), and 8 (test) all-text
-rows. Generation resampled 1 train row, 1 test-diagnostic row, and 32 val-diagnostic rows that
-would have matched an earlier manifest.
+they contain no images. The full manifests contain 85 (train), 14 (val), and 22 (test) all-text
+rows. Generation resampled 5 train rows, 5 val rows, 2 test-diagnostic rows, and 34
+val-diagnostic rows that would have matched an earlier manifest.
 
 **What the audit cannot do:**
 - **Near-duplicates** (a shifted, rescaled, or re-encoded copy of an image) differ in hash and are
@@ -317,9 +340,9 @@ Design choices, and why:
   output. Padding is excluded as attention keys (`src_key_padding_mask`) and from pooling
   (`masked_fill`).
 - **No positional embeddings.** Addition is order-invariant and each operand is one digit, so
-  positions carry no information. Without them the whole model is permutation-invariant. The
-  test-time permutation check measured prediction agreement 1.0000 and a max logit difference
-  of 1.4 × 10⁻⁶ (float rounding).
+  positions carry no information. Without them the whole model is permutation-invariant. On
+  `full-s0`, the test-time permutation check measured prediction agreement 1.0000 on both val
+  and test, with max logit differences ≤ 9.9 × 10⁻⁵ (float rounding).
 - **Independently initialized layers.** `nn.TransformerEncoder(layer, num_layers)` builds its
   stack with `copy.deepcopy` (verified in the installed torch source, `_get_clones`), so all its
   layers start with identical weights. This model builds a `ModuleList` of separately constructed
@@ -438,13 +461,17 @@ different strength under that setting.
 - An *optimizer step* is one `optimizer.step()`, covering `grad_accum_steps` micro-batches.
   `global_step` counts **only** optimizer steps and is the x-axis of every plot and log.
 - An *epoch* is one pass over the fixed training manifest. With `drop_last` it has
-  ⌊20000 / 64⌋ = 312 micro-batches; an incomplete accumulation group at epoch end is discarded.
+  ⌊100000 / 256⌋ = 390 micro-batches under `local.yaml`; an incomplete accumulation group at
+  epoch end is discarded. 200 epochs × 390 = 78,000 planned optimizer steps.
 - `train.max_steps` caps optimizer steps, `train.epochs` caps passes, and whichever comes first
   ends the run.
 
 Settings:
-- **Optimizer:** AdamW, lr 3e-4, constant schedule (optional `warmup_cosine`). Weight decay 0.01
-  applies only to ≥ 2-D Linear/Conv/attention weights, not to biases, norms, or embeddings.
+- **Optimizer:** AdamW, lr 3e-4. Weight decay 0.01 applies only to ≥ 2-D Linear/Conv/attention
+  weights, not to biases, norms, or embeddings.
+- **Schedule:** `local.yaml` and `h100.yaml` use `warmup_cosine`: linear warmup over 500 steps,
+  then cosine decay to 0 at the last planned step. The code default (and `debug.yaml`) is a
+  constant learning rate.
 - **Gradients:** clipped to norm 1.0.
 - **Shuffling:** a per-epoch permutation seeded by (seed, epoch).
 - **Validation and selection:** validation runs every `eval_every_steps` and at the end.
@@ -460,9 +487,11 @@ Settings:
     already stopped stays stopped unless you raise the patience. `summary.json` records
     `stopped_early` and `planned_optimizer_steps`.
   - Accuracy is used rather than loss because, on `full-s0`, validation loss reached its minimum
-    (0.618) at step 29k while accuracy kept improving (0.929 at 29k, 0.945 at 47k). A loss-based
-    patience of 10 would have stopped at 39k. Replayed over `full-s0`'s first 55 validations,
-    the accuracy rule with patience 15 never triggers.
+    (0.618) at step 29k while accuracy kept improving (0.929 at 29k, 0.945 at 47k, best 0.959
+    at 69k). A loss-based patience of 10 would have stopped at 39k. Replayed over all 78 of
+    `full-s0`'s validations, the accuracy rule with patience 15 never triggers: the longest
+    stretch without a new best was 9 validations. (`full-s0` itself predates early stopping and
+    ran all 200 epochs.)
   - With `warmup_cosine`, an early stop also skips the low-learning-rate end of the schedule.
 
 **Checkpoints** (`runs/<run>/checkpoints/{best,last}.pt`) contain:
@@ -494,7 +523,8 @@ so a checkpoint saved on MPS loads on CUDA or CPU. This is tested.
   `train.amp_dtype=bf16` is enabled only after `torch.cuda.is_bf16_supported()`; TF32 is opt-in.
   No DDP, FlashAttention, or `torch.compile`.
 - **Throughput** is timed after `torch.mps.synchronize()` / `torch.cuda.synchronize()`, measured
-  end to end including data loading, and validation time is excluded.
+  end to end including data loading, and validation time is excluded. Measured on the M4 Pro:
+  a median of 6,772 seq/s for `full-s0` (batch 256, 4 persistent workers, previous encoder).
 - **Data-loader workers.**
   - `train.num_workers` sets how many processes build batches in parallel. With
     `train.persistent_workers: true`, they stay alive across epochs and validation passes, so
@@ -505,19 +535,24 @@ so a checkpoint saved on MPS loads on CUDA or CPU. This is tested.
 
 ### 6. Evaluation
 
-`evaluate.py --checkpoint ... --split {val,test}` (test only when you ask for it) writes
-`metrics.json`, `predictions.csv` (answers as text), and figures. The report keeps several
+`evaluate.py --checkpoint ... --split {val,test}` (test only when you ask for it; optional
+`--device`, `--out`, `--wandb-mode`) writes to `runs/<run>/eval_<split>_<checkpoint>/`:
+`metrics.json`, `predictions.csv` (answers as text), `metrics_summary.png` (accuracy, macro F1,
+and MAE next to the majority baseline, one panel per metric), `examples.png`, `failures.png`,
+`breakdown.png`, and `stress.png`. It refuses to run if the pools or manifests on disk differ
+from the checkpoint's. It also logs the evaluation to W&B (see
+[Logging and Weights & Biases](#7-logging-and-weights--biases)). The report keeps several
 populations **separate**:
 
 | section | what it is |
 |---|---|
 | **main** | the naturally sampled split: exact-sum accuracy, macro F1, MAE, loss, n; accuracy by number of image operands (0–10) and by sum range (0–9 … 80–90), each with n |
-| **majority baseline** | always answer the most frequent training sum (45 for the main data: **3.84%** test accuracy); its accuracy, macro F1, and MAE are reported |
+| **majority baseline** | always answer the most frequent training sum (45 for the full data: **4.33%** test accuracy); its accuracy, macro F1, and MAE are reported |
 | text-only set | 1,000 all-text sequences (no handwriting needed) |
 | all-image set | 1,000 all-image sequences from the same split's pool |
 | permutation test | operands shuffled per row; agreement with the original predictions + max logit difference |
 | **ORACLE substitution** | every image replaced by its *true* digit token. This uses ground-truth labels, so it is a diagnostic upper reference, **not** a result. It also changes the modality mix: every row becomes all-text, which is rare (0.1%) in training. |
-| sums unseen in training | count and accuracy of eval rows whose sum never occurs in the training manifest (2 rows in the main test set) |
+| sums unseen in training | count and accuracy of eval rows whose sum never occurs in the training manifest (full data: 1 val row, 0 test rows) |
 | **stress cases** | constructed all-0 / all-9 rows (text, image, mixed). Sums 0 and 90 essentially never occur in training (p = 1e-10), so failures here are expected and reported apart from natural results |
 
 **Macro F1** treats each sum class equally, unlike accuracy:
@@ -531,7 +566,7 @@ populations **separate**:
   - Accuracy is dominated by the common sums near 45. Macro F1 gives a rare sum like 12 (a
     handful of validation rows) the same weight as 45, so it is sensitive to the tails and
     noisier.
-  - Classes that never occur in training (0–10, 77–90 for the main data) can only score 0 when
+  - Classes that never occur in training (0–9 and 83–90 for the full data) can only score 0 when
     they appear in an evaluation set.
   - Always guessing 45 scores almost nothing: one class with a small F1, averaged with zeros.
 - Checkpoint selection still uses validation **accuracy**; macro F1 is reported alongside it.
@@ -547,14 +582,16 @@ only. Neither is cherry-picked.
 Every run always writes local, machine-readable records, so no network or credentials are needed:
 
 - `runs/<run>/config.json` holds the resolved config, seeds, device, parameter counts,
-  source/sequence counts, and data IDs.
-- `runs/<run>/metrics.jsonl` has one JSON object per event, each with `optimizer_step`.
+  source/sequence counts, and data IDs. A resumed session writes `config_resumed.json` instead.
+- `runs/<run>/metrics.jsonl` has one JSON object per event, each with `optimizer_step`,
+  `wall_time_s`, and a fractional `epoch`.
   - Training: `train/loss`, `train/accuracy`, `train/macro_f1`, `train/lr`,
-    `train/samples_per_sec`, `train/grad_norm_preclip`. These are averaged over the sequences of
-    each logging interval. `train/macro_f1` uses per-class counts accumulated on the device over
-    that interval.
+    `train/samples_per_sec`, `train/steps_per_sec`, `train/grad_norm_preclip`. These are averaged
+    over the sequences of each logging interval. `train/macro_f1` uses per-class counts
+    accumulated on the device over that interval.
   - Validation: `val/loss`, `val/accuracy`, `val/macro_f1`, `val/mae`, each over the full
-    validation set.
+    validation set, plus `val/best_accuracy` and `val/validations_without_improvement` (the
+    early-stopping counter).
   - `summary.json` adds `best_val_macro_f1`, the macro F1 of the accuracy-selected checkpoint.
 - `runs/<run>/loss_curves.png` plots training and validation loss, accuracy, and macro F1 **against
   optimizer steps**. Training points are interval means in train mode (dropout and augmentation
@@ -562,16 +599,20 @@ Every run always writes local, machine-readable records, so no network or creden
 - `train_examples.png` (what the model sees) and `val_predictions_best.png`.
 - `summary.json`.
 
-W&B modes (`logging.wandb_mode`): `disabled` (wandb is never imported; the debug default),
-`offline` (the local/H100 default; writes to `runs/<run>/wandb/`), or `online`.
+W&B modes (`logging.wandb_mode`):
+- `disabled`: wandb is never imported. This is the code default and `debug.yaml`'s setting.
+- `offline`: writes to `runs/<run>/wandb/`; upload later with `wandb sync`.
+- `online`: streams to wandb.ai. **`local.yaml` and `h100.yaml` use this**, with project
+  `digit-summation` and entity `neoscith-solo`, so they need `wandb login` (or `WANDB_API_KEY`)
+  and network access.
 
 ```bash
 wandb login                                   # once; or export WANDB_API_KEY in your shell (never commit it)
-$PY train_local.py --config configs/local.yaml \
-    --set logging.wandb_mode=online \
-    --set logging.wandb_project=digit-summation \
-    --set logging.wandb_entity=<your-entity> \
-    --set logging.run_name=local-affine-s0
+$PY train_local.py --config configs/local.yaml --set logging.run_name=full-affine-s0          # online
+$PY train_local.py --config configs/local.yaml --set logging.wandb_entity=<your-entity> \
+    --set logging.run_name=full-affine-s0                                                     # your own entity
+$PY train_local.py --config configs/local.yaml --set logging.wandb_mode=offline \
+    --set logging.run_name=full-affine-s0                                                     # no network
 wandb sync runs/<run>/wandb/offline-run-*     # upload an offline run later
 ```
 
@@ -581,31 +622,46 @@ curves). There is no per-step image or gradient logging. Checkpoint artifact upl
 (`--set logging.upload_checkpoints=true`). The project never reads, prints, or logs the API key,
 and logged configs pass through a key-name filter.
 
+**Evaluations in W&B.** Each `evaluate.py` call is logged as its own W&B run:
+- **Name and group:** the run is named `<run>-eval_<split>_<checkpoint>` (e.g.
+  `full-s0-eval_test_best`), has job type `eval`, and sits in the training run's W&B group.
+  Training runs are grouped under their run name too; `full-s0` itself predates grouping.
+- **Metrics:** every number in `metrics.json` goes to the run's summary under `<split>/...`:
+  `test/accuracy`, `test/macro_f1`, `test/mae`, `test/majority_baseline/accuracy`,
+  `test/by_image_count/5/accuracy`, `test/by_sum_range/40-49/accuracy`,
+  `test/diagnostics/oracle_substitution/accuracy`, `test/stress_cases/all_9_image/accuracy`, and
+  so on (126 values for `full-s0`'s test evaluation). They show as columns in the W&B runs table.
+- **Figures:** the five evaluation figures are logged as images.
+- **Mode:** it follows the checkpoint's `logging.wandb_mode`, so `full-s0`-style runs log online and
+  debug runs don't log at all. Override it with `--wandb-mode {disabled,offline,online}`; an
+  offline evaluation is written to `runs/<run>/eval_<split>_<checkpoint>/wandb/`.
+
 ---
 
 ## Experiments to run next
 
 All of these are commands, **not results**. Each comparison uses the same frozen manifests
-(`data/manifests/main`). `compare_runs.py` verifies that before printing a table.
+(`data/manifests/full`). `compare_runs.py` verifies that before printing a table.
 
 ```bash
 # Augmentation: controlled comparison (identical pools + val/test manifests). Use >= 3 seeds;
-# single-seed differences can be noise. Do not assume augmentation helps.
+# single-seed differences can be noise. Do not assume augmentation helps. Run names must be new:
+# train_local.py refuses an existing runs/<name> (full-affine-s0 is also quick-start step 9).
 for seed in 0 1 2; do
   for mode in none affine affine_elastic; do
     $PY train_local.py --config configs/local.yaml --set augment.mode=$mode --set train.seed=$seed \
-        --set logging.run_name=local-$mode-s$seed
+        --set logging.run_name=full-$mode-s$seed
   done
 done
-$PY compare_runs.py runs/local-*-s0 runs/local-*-s1 runs/local-*-s2
+$PY compare_runs.py runs/full-*-s0 runs/full-*-s1 runs/full-*-s2
 
 # Data efficiency: fewer independent handwriting samples (nested subsets). This needs its own
 # manifest_dir because it changes the pools.
-$PY prepare_data.py --config configs/local.yaml --set data.train_source_fraction=0.1 --set data.manifest_dir=data/manifests/main-src10
-$PY train_local.py  --config configs/local.yaml --set data.train_source_fraction=0.1 --set data.manifest_dir=data/manifests/main-src10 --set logging.run_name=local-src10
+$PY prepare_data.py --config configs/local.yaml --set data.train_source_fraction=0.1 --set data.manifest_dir=data/manifests/full-src10
+$PY train_local.py  --config configs/local.yaml --set data.train_source_fraction=0.1 --set data.manifest_dir=data/manifests/full-src10 --set logging.run_name=full-src10
 
 # Ablations
-$PY train_local.py --config configs/local.yaml --set model.use_modality_embedding=false --set logging.run_name=local-nomod
+$PY train_local.py --config configs/local.yaml --set model.use_modality_embedding=false --set logging.run_name=full-nomod
 
 # Loader speed: only num_workers / persistent_workers change, so the training data is identical.
 # A capped max_steps keeps each run short. Don't run other GPU jobs at the same time.
@@ -643,39 +699,87 @@ Nothing in this repo provisions cloud resources.
 
 ## What has actually been run
 
-All of the following ran in this session on the M4 Pro (MPS), with no full training run:
+All of the following ran on the M4 Pro (MPS) between 2026-10-15 and 2026-10-16.
+
+### Checks
 
 | check | outcome |
 |---|---|
 | `sanity_checks.py env` | all versions found. Op probe (forward + backward + AdamW on mixed / all-text / all-image / padded batches) **OK on CPU and MPS**. `PYTORCH_ENABLE_MPS_FALLBACK` not set |
-| `pytest` | **82 passed** in ~46 s (the DataLoader-worker test starts real worker processes): tokenizer, config, pools/dedup/fractions, manifests/targets, cross-split resampling, dataset/collate contract, audit (passes on clean data, catches injected leaks), augmentation (normalize once, black fill, per-(epoch, row) seeding, shared child generator, identical batches for 0/2/2-persistent workers), model (shapes, masks/padding, all-image/all-text, gradient branches, permutation invariance, bidirectionality, independent layers, CPU vs MPS), engine (macro F1 vs sklearn + hand cases + device-side counts on CPU/MPS, checkpoint round trip, MPS load, RNG, sampler, weight-decay groups, accumulation step counting, resume, early stopping on val accuracy incl. resume, tolerant checkpoint-state loading) |
-| `prepare_data.py` (debug + main) | **audit 76/76 passed**. No exact duplicates in MNIST; pools are 50,000 / 10,000 / 10,000 (debug: 2,500 / 500 / 501). A re-run verified identical data, and a changed config was refused |
-| `inspect_data.py` (debug + main) | figures written. Normalization, pixel ranges, tokenization trace, and distributions as reported above |
+| `pytest` | **88 passed** in ~40 s (re-run 2026-10-16; the DataLoader-worker test starts real worker processes). `pytest CNN-encoder-test`: 7 passed. Coverage: tokenizer, config, pools/dedup/fractions, manifests/targets, cross-split resampling, dataset/collate contract, audit (passes on clean data, catches injected leaks), augmentation (normalize once, black fill, per-(epoch, row) seeding, shared child generator, identical batches for 0/2/2-persistent workers), model (shapes, masks/padding, all-image/all-text, gradient branches, permutation invariance, bidirectionality, independent layers, CPU vs MPS), engine (macro F1 vs sklearn + hand cases + device-side counts on CPU/MPS, checkpoint round trip, MPS load, RNG, sampler, weight-decay groups, accumulation step counting, resume, early stopping on val accuracy incl. resume, tolerant checkpoint-state loading), evaluation reporting (metric flattening for W&B, no W&B when disabled, summary plot incl. old metrics without macro F1) |
+| `prepare_data.py` (debug, main, full) | **audit 76/76 passed** for all three. No exact duplicates in MNIST; pools are 50,000 / 10,000 / 10,000 (debug: 2,500 / 500 / 501). A re-run verified identical data (full: re-verified 2026-10-16), and a changed config was refused |
+| `inspect_data.py` (debug, main, full) | figures written. Normalization, pixel ranges, tokenization trace, and distributions as reported above. The full-data numbers come from a 2026-10-16 run with `configs/local.yaml`; the `runs/inspect-local/` on this machine is older and shows the 20k `main` data until step 3 is re-run |
 | `sanity_checks.py shapes` | every boundary as in the diagram. Step-by-step == forward. Layers independent |
 | `sanity_checks.py step` | initial loss 4.5109 = ln 91. Update 1: head-only gradient (expected). Update 2: finite, non-zero gradient in every component. PAD row gradient 0. Batch loss 4.51 → 3.95 after two updates (a wiring check only) |
 | `sanity_checks.py overfit` (64 fixed mixed examples, aug off, dropout 0, lr 1e-3, cap 300) | **passed: 100% at update 30** (fixed-set loss 0.056) |
 | same, all-image fixed set (`image_probability=1.0`) | **passed: 100% at update 50**, so the image path can memorize too |
 | same, at the training LR 3e-4 | **passed: 100% at update 40** |
+| overfit again with the current ReLU / max / BatchNorm encoder (lr 1e-3) | mixed set **100% at update 40** (fixed-set loss 0.013); all-image set **100% at update 70** |
 | `train_local.py` debug, 60 updates | pipeline OK (checkpoints, curves, galleries, summary). It found and fixed one bug: `torch.__version__` in checkpoints broke `weights_only` loading. Two identical runs logged identical losses. Throughput ≈ 1,800 seq/s end to end |
 | `evaluate.py --split val` on that debug checkpoint | all outputs written. Permutation agreement 1.0000, max logit difference 1.4e-6 |
 | resume from `last.pt` mid-epoch | continued at update 60 and stopped at the epoch cap (62) |
 | `num_workers` 0 vs 2 (persistent), 40 debug updates each | identical training losses at every logged step. Final weights differ by ≤ 2.5e-7, the same size as two runs of an identical 0-worker config (≤ 3.5e-7), i.e. GPU float nondeterminism, not data. The same checkpoint evaluated with 0 vs 2 workers gives bit-identical inputs, logits, and loss |
 | W&B **offline** debug run (20 updates) | offline run written, with the `wandb sync` command printed. No key fields in the local records |
+| W&B **online** | used by `full-s0` and the three `local-20261015-*` runs |
+| W&B evaluation runs (2026-10-16) | `evaluate.py --wandb-mode offline` on a debug checkpoint: the offline run holds all 153 metrics, matching `metrics.json`, plus the five figures. `full-s0`'s existing test evaluation was then logged online from its saved `metrics.json` (no re-evaluation) as `full-s0-eval_test_best`: 126 metrics + 5 figures |
+| `CNN-encoder-test/digit_cnn.py`, 3 seeds × 2 encoders | supervised digit accuracy and implied sum ceilings; the ReLU / max / BatchNorm variant was adopted as the default. See [CNN-encoder-test/README.md](CNN-encoder-test/README.md) |
 
 **The tiny-overfit successes show only that the wiring can memorize.** The debug run's numbers
 (validation accuracy 6.6% after 60 updates, vs. the 5.0% majority baseline on that split) are a
 pipeline smoke test and **say nothing about convergence**.
 
-**Not run yet:**
-- the full local experiment
-- test-set evaluation of a real checkpoint
-- augmentation, data-efficiency, and ablation comparisons
-- any H100 run
-- W&B online mode
+### Training runs
 
-The full local run is estimated at roughly 10 minutes on the M4 Pro. That estimate comes from the
-debug run's measured throughput (12.5k updates × 64 sequences ÷ ~1,800 seq/s, plus validation);
-it has not been measured.
+All are seed 0, `affine` augmentation, lr 3e-4, on MPS, and use the *previous* image encoder
+(GELU, no BatchNorm). They differ in several settings at once, so they are not a controlled
+comparison.
+
+| run | data | batch / epochs / schedule | pooling | updates | best val acc (step) | training time |
+|---|---|---|---|---|---|---|
+| `local-affine-s0` | main (20k) | 64 / 40 / constant | max | 12,480 | 0.757 (12,480) | 365 s |
+| `local-20261015-134910` | main (20k) | 64 / 100 / constant | max | 31,200 | 0.874 (29,250) | 948 s |
+| `local-20261015-143936` | main (20k) | 128 / 100 / warmup_cosine | avg | 15,600 | 0.870 (15,000) | 347 s |
+| `local-20261015-151200` | main (20k) | 128 / 200 / warmup_cosine | avg | 31,200 | 0.930 (31,000) | 686 s |
+| **`full-s0`** | full (100k) | 256 / 200 / warmup_cosine | avg | 78,000 | **0.9587 (69,000)** | 3,069 s |
+
+Training time includes validation passes. `full-s0` ran at a median 6,772 seq/s with 4
+persistent workers.
+
+### Results: `full-s0` (best checkpoint, step 69,000)
+
+| | val | test |
+|---|---|---|
+| **exact-sum accuracy** (n = 20,000) | **0.9587** | **0.9550** |
+| macro F1 | 0.766 | 0.782 |
+| MAE | 0.102 | 0.108 |
+| majority baseline (always "45") | 0.0429 | 0.0433 |
+| text-only set (n = 1,000) | 0.996 | 1.000 |
+| all-image set (n = 1,000) | 0.838 | 0.842 |
+| ORACLE substitution (diagnostic, uses true labels) | 0.998 | 0.998 |
+| permutation agreement / max logit difference | 1.0000 / 9.2e-5 | 1.0000 / 9.9e-5 |
+| stress cases (constructed all-0 / all-9 rows) | 0 of 202 | 0 of 202 |
+
+- **Vision is at the supervised reference.** Validation accuracy (0.9587) matches the exact-sum
+  ceiling implied by a CNN with the same GELU / avg encoder trained directly on digit labels
+  (0.9588 ± 0.0021 over 3 seeds, `CNN-encoder-test/`).
+- **Accuracy falls with the number of image operands.** On test: 0.984 with 2 images (n = 887),
+  0.953 with 5 (n = 4,899), 0.920 with 8 (n = 852), and 0.818 with 10 (n = 22).
+- **Rare sums are the weak point.** That is why macro F1 is far below accuracy. Test accuracy
+  is 0.963 for sums 40–49 (n = 8,225) but 0.464 for 70–79 (n = 69). Every stress case fails: rows
+  summing to 0 are predicted as 12 or 14, and rows summing to 90 as 78 or 82.
+- **The test split has been used** for this checkpoint. Base further development decisions on
+  validation.
+
+Evaluation outputs are in `runs/full-s0/eval_val_best/` and `runs/full-s0/eval_test_best/`. The
+test evaluation is also in W&B as the run `full-s0-eval_test_best` (project
+`neoscith-solo/digit-summation`); the validation evaluation was made before W&B logging existed
+and is local only.
+
+**Not run yet:**
+- a sum-model run with the current default encoder (ReLU / max pooling / BatchNorm)
+- more than one seed of any sum-model configuration
+- augmentation, data-efficiency, and ablation comparisons
+- any H100 run (none is recorded in `runs/`)
 
 ---
 
@@ -686,6 +790,7 @@ it has not been measured.
 | `MNIST not found` / `No manifests in ...` | run `prepare_data.py --config <same config>` first |
 | `Frozen data ... differs ... Refusing to overwrite` | the config changes the data; use a new `data.manifest_dir`, or `--overwrite` deliberately |
 | `Manifest 'train' ... has N rows but the config asks for M` | the config and `manifest_dir` don't match; re-run `prepare_data.py` with the training config |
+| `FileExistsError: runs/<name> already exists` | pick a new `logging.run_name`. Existing names include `full-s0` and `local-affine-s0`; to continue a run, use `--resume runs/<name>/checkpoints/last.pt` |
 | `An operation is not implemented on MPS` | run with `--device cpu`. Or set `PYTORCH_ENABLE_MPS_FALLBACK=1` knowingly: those ops then run silently on the CPU |
 | loud `PYTORCH_ENABLE_MPS_FALLBACK=1` warning | `unset PYTORCH_ENABLE_MPS_FALLBACK` |
 | slow data loading on the Mac | `--set train.num_workers=4 --set train.persistent_workers=true` (speed only; the data is identical for any value) |
@@ -699,14 +804,19 @@ it has not been measured.
 
 ## Limitations
 
-- **No trained-model results yet.** Every accuracy claim awaits steps 9–10.
+- **One seed, previous encoder.** The only full-data result (`full-s0`) is a single seed with
+  the GELU / avg / no-BatchNorm encoder. The current default encoder is untested in the sum
+  model, and seed-to-seed variation is unmeasured.
 - **Sum-only supervision.** The CNN must learn digit identity solely through the sum loss,
-  where credit assignment over about 5 images per row is weak. Whether 20k sequences × 40 epochs
-  is enough is unknown; the budgets are starting points. An auxiliary digit loss or CNN
-  pretraining (training-pool labels only, as a separately named, disabled-by-default experiment)
-  is **not implemented**.
-- **Classification over 0–90 cannot extrapolate.** 24 of the 91 classes never occur in the
-  training manifest, so the extremes (stress cases) are expected to fail.
+  where credit assignment over about 5 images per row is weak. With 100k sequences × 200 epochs
+  this was enough to reach the supervised-reference ceiling (see Results); smaller budgets fell
+  short (0.93 or less on the 20k data). An auxiliary digit loss or CNN pretraining
+  (training-pool labels only, as a separately named, disabled-by-default experiment) is **not
+  implemented**.
+- **Classification over 0–90 cannot extrapolate.** 18 of the 91 classes never occur in the full
+  training manifest, and rare sums are learned poorly: `full-s0` fails every stress case, and
+  its macro F1 (0.77–0.78) is far below its accuracy.
+- **The test split has been used once** (`full-s0`). Use validation for development decisions.
 - **Validation is not writer-independent.** Near-duplicate images are not detected.
 - **Reproducibility:** the training data stream (order + augmentation) is identical for any
   `num_workers`, persistence, or batch size, and on resume. GPU arithmetic is not bit-identical

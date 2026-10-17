@@ -1,17 +1,25 @@
 # Tiny configuration for wiring checks and fast end-to-end smoke runs (minutes, not hours).
 # Results from this config say nothing about convergence or final accuracy.
-name: debug
+name: debug-full
 
 data:
-  manifest_dir: data/manifests/debug
-  # 5% stratified subsets of each source pool: ~2.5k train, 500 val, 500 test images.
-  train_source_fraction: 0.05
-  val_source_fraction: 0.05
-  test_source_fraction: 0.05
-  num_train_sequences: 2000
-  num_val_sequences: 500
-  num_test_sequences: 500
-  num_diagnostic_sequences: 200
+  # manifest_dir: data/manifests/debug
+  # # 5% stratified subsets of each source pool: ~2.5k train, 500 val, 500 test images.
+  # train_source_fraction: 0.05
+  # val_source_fraction: 0.05
+  # test_source_fraction: 0.05
+  # num_train_sequences: 2000
+  # num_val_sequences: 500
+  # num_test_sequences: 500
+  # num_diagnostic_sequences: 200
+  manifest_dir: data/manifests/full
+  train_source_fraction: 1.0
+  val_source_fraction: 1.0
+  test_source_fraction: 1.0
+  num_train_sequences: 100000
+  num_val_sequences: 20000
+  num_test_sequences: 20000
+  num_diagnostic_sequences: 1000
 
 augment:
   mode: affine

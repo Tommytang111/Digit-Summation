@@ -25,7 +25,7 @@ train:
   seed: 0
   batch_size: 256        # optimizer steps per epoch (train_sequences // batch_size)
   grad_accum_steps: 1
-  epochs: 200            # ~30k optimizer steps, currently takes ~ 6 minutes per training run.
+  epochs: 200            # ~78k optimizer steps, currently takes ~ 51 minutes per training run.
   max_steps: null
   eval_every_steps: 1000
   log_every_steps: 50
@@ -42,7 +42,7 @@ train:
   amp_dtype: none       # float32 on MPS
 
 logging:
-  wandb_mode: online   # no network needed; `wandb sync` later, or --set logging.wandb_mode=online
+  wandb_mode: online   # options offline -> `wandb sync` or online: --set logging.wandb_mode=online
   wandb_project: digit-summation
   wandb_entity: neoscith-solo
 

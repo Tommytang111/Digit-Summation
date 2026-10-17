@@ -10,6 +10,9 @@ W&B modes (logging.wandb_mode):
     offline   logs to <run_dir>/wandb/; upload later with `wandb sync <run_dir>/wandb/offline-run-*`
     online    streams to wandb.ai using your existing `wandb login` or the WANDB_API_KEY env var
 
+A training run is a W&B run grouped under its run-directory name. Each evaluate.py call is a
+separate W&B run (job_type "eval") in the same group, so a run's evaluations sit next to it.
+
 This module never reads, prints, or logs an API key. wandb itself finds the credentials.
 """
 
@@ -39,6 +42,51 @@ def read_metrics(path: Path) -> list[dict]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def flatten_metrics(metrics: dict, prefix: str = "") -> dict[str, float]:
+    """Nested metrics -> {"prefix/a/b": number}, the flat scalar form W&B summaries need.
+
+    Lists of group rows (e.g. by_image_count: [{"group": 5, "accuracy": ..., "n": ...}]) are keyed
+    by their "group". Strings, None values, and other lists carry no scalar and are skipped.
+    """
+    flat = {}
+    for key, value in metrics.items():
+        name = f"{prefix}/{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            flat.update(flatten_metrics(value, name))
+        elif isinstance(value, list) and value and all(isinstance(item, dict) and "group" in item for item in value):
+            for item in value:
+                flat.update(flatten_metrics({k: v for k, v in item.items() if k != "group"}, f"{name}/{item['group']}"))
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            flat[name] = value
+    return flat
+
+
+def log_evaluation(logging_cfg, run_config: dict, summary: dict, images: dict[str, Path], name: str, group: str, directory: Path) -> None:
+    """Log one evaluation as its own W&B run (job_type "eval") in its training run's group.
+
+    `summary` (flat scalars, see flatten_metrics) goes to the run summary, so each metric is one
+    value in the W&B runs table rather than a one-point chart. `images` maps W&B keys to PNG
+    files. Does nothing when logging_cfg.wandb_mode is "disabled".
+    """
+    if logging_cfg.wandb_mode == "disabled":
+        return
+    import wandb  # imported lazily so the disabled mode never needs it
+
+    run = wandb.init(
+        project=logging_cfg.wandb_project,
+        entity=logging_cfg.wandb_entity,
+        name=name,
+        group=group,
+        job_type="eval",
+        mode=logging_cfg.wandb_mode,
+        dir=str(directory),
+        config=sanitize(run_config),
+    )
+    run.summary.update(summary)
+    run.log({key: wandb.Image(str(path)) for key, path in images.items()})
+    run.finish()
+
+
 class ExperimentLogger:
     """Writes local records and mirrors scalars/images to W&B when enabled.
 
@@ -65,6 +113,7 @@ class ExperimentLogger:
                 project=logging_cfg.wandb_project,
                 entity=logging_cfg.wandb_entity,
                 name=self.run_dir.name,
+                group=self.run_dir.name,  # evaluate.py logs this run's evaluations to the same group
                 mode=logging_cfg.wandb_mode,
                 dir=str(self.run_dir),
                 config=sanitize(run_config),
