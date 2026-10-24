@@ -5,8 +5,8 @@
     python bonus_checks.py overfit   --config configs/bonus_debug.yaml   # memorize 64 fixed rows, <= 300 updates
     python bonus_checks.py structure --config configs/bonus_debug.yaml   # invariances that need no training
 
-Add `--set bonus.architecture=items_only_no_positions` (or sinusoidal_plus_sum_summary) to check
-another variant. `structure` covers all three variants unless --checkpoint is given.
+Add `--set bonus.architecture=items_only_rope` (or items_only_alibi) to check another variant.
+`structure` covers all five variants unless --checkpoint is given.
 
 `structure` reports properties of the architecture itself, not learned skills:
   - padding: extra right padding must not change outputs (any correct implementation);
@@ -15,6 +15,8 @@ another variant. `structure` covers all three variants unless --checkpoint is gi
     (count-blind by construction; more training cannot fix it);
   - sinusoidal variants: the same operand gets a different representation at each position.
     That makes counting *possible*, but does not make it learned.
+  - RoPE/ALiBi items-only variants: relative attention still averages identical value vectors,
+    so perfectly identical repeated operands remain count-blind (a documented limitation).
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ import torch
 import visualization as viz
 from bonus_data import bonus_collate
 from bonus_engine import load_bonus_data, load_bonus_model, score, summarize, training_dataset
-from bonus_model import ARCHITECTURES, bonus_model_inputs, build_bonus_model, teacher_forced_loss
+from bonus_model import ARCHITECTURES, bonus_model_inputs, build_bonus_model, position_schemes, teacher_forced_loss
 from config import load_config
 from engine import build_optimizer, make_loader, resolve_device, seed_everything
 from model import count_parameters
@@ -120,9 +122,10 @@ def command_shapes(args) -> int:
             generated = model.generate(**inputs, max_new_tokens=cfg.bonus.max_new_tokens)
         print(f"\n== {architecture} ({count_parameters(model)['total']:,} parameters) ==")
         print(f"operands: token_ids {list(inputs['token_ids'].shape)} padding_mask {list(inputs['padding_mask'].shape)} (lengths 1/5/10/20)")
-        print(f"  embed_operands -> {list(features.shape)}; operand positions {'sinusoidal ' + str(list(model.positions(20).shape)) if model.use_operand_positions else 'none'}")
+        schemes = position_schemes(architecture)
+        print(f"  embed_operands -> {list(features.shape)}; operand position scheme: {schemes['operands']}")
         print(f"  encoder memory -> {list(memory.shape)}")
-        print(f"decoder_input {list(decoder_input.shape)} (+ answer positions {list(model.positions(3).shape)}), causal mask [3, 3], padding mask {list(decoder_padding.shape)}")
+        print(f"decoder_input {list(decoder_input.shape)} (answer position scheme: {schemes['answer']}), causal mask [3, 3], padding mask {list(decoder_padding.shape)}")
         print(f"  logits -> {list(logits.shape)} (output vocabulary 13); summary path: {model.summary_projection is not None}")
         print(f"  generate (greedy, cap {cfg.bonus.max_new_tokens}) -> {list(generated.shape)}")
     return 0
@@ -250,7 +253,7 @@ def command_structure(args) -> int:
         for key, value in report.items():
             if key != "architecture":
                 print(f"    {key:<55} {value:.2e}" if isinstance(value, float) else f"    {key:<55} {value}")
-    print("\nPadding diffs must be ~0 for every variant. items_only_no_positions must show ~0 repeated-operand differences")
+    print("\nPadding diffs must be ~0 for every variant. No-position, RoPE, and ALiBi items-only variants have ~0 repeated-operand differences")
     print("(count-blind by construction). Sinusoidal variants differ across positions, which makes counting possible, not learned.")
     return 0
 

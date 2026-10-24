@@ -8,7 +8,7 @@ import torch
 import bonus_engine
 from bonus_data import build_bonus_data
 from bonus_engine import checkpoint_extra, load_bonus_model, run_bonus_training, summarize
-from bonus_model import build_bonus_model
+from bonus_model import ARCHITECTURES, build_bonus_model, position_schemes
 from config import config_from_dict, config_to_dict
 from conftest import make_synthetic_arrays, tiny_config
 from dataset import save_manifests, save_source_pools
@@ -50,9 +50,10 @@ def test_summarize_counts_invalid_outputs_and_mae_denominator():
     assert s["status_counts"] == {"empty": 1, "missing_eos": 1, "valid": 2}
 
 
-def test_bonus_checkpoint_round_trip_and_cross_task_guards(tmp_path):
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_bonus_checkpoint_round_trip_and_cross_task_guards(tmp_path, architecture):
     cfg = bonus_cfg(tmp_path)
-    cfg.bonus.architecture = "sinusoidal_plus_sum_summary"
+    cfg.bonus.architecture = architecture
     torch.manual_seed(0)
     model = build_bonus_model(cfg)
     optimizer = build_optimizer(model, 1e-3, 0.0)
@@ -60,8 +61,8 @@ def test_bonus_checkpoint_round_trip_and_cross_task_guards(tmp_path):
     path = save_checkpoint(tmp_path / "bonus.pt", model, optimizer, scheduler, cfg, TrainState(global_step=3), {"source_pool_id": "x", "manifest_ids": {}}, extra=checkpoint_extra(cfg))
     loaded, loaded_cfg, checkpoint = load_bonus_model(path, torch.device("cpu"))
     assert checkpoint["task"] == "bonus_decoder" and checkpoint["output_vocab"] == OUTPUT_VOCAB
-    assert checkpoint["architecture"] == "sinusoidal_plus_sum_summary" and checkpoint["positions"]["operands"] == "sinusoidal"
-    assert loaded_cfg.bonus.architecture == "sinusoidal_plus_sum_summary" and checkpoint["train_state"]["global_step"] == 3
+    assert checkpoint["architecture"] == architecture and checkpoint["positions"] == position_schemes(architecture)
+    assert loaded_cfg.bonus.architecture == architecture and checkpoint["train_state"]["global_step"] == 3
     assert all(torch.equal(a, b) for a, b in zip(model.state_dict().values(), loaded.state_dict().values()))
     with pytest.raises(ValueError, match="not a main-task classifier"):
         load_model_from_checkpoint(path, torch.device("cpu"))
@@ -74,8 +75,10 @@ def test_bonus_checkpoint_round_trip_and_cross_task_guards(tmp_path):
         assert next(on_mps.parameters()).device.type == "mps"
 
 
-def test_training_runs_selects_on_trained_lengths_and_resumes(prepared_bonus):
+@pytest.mark.parametrize("architecture", ("items_only_sinusoidal", "items_only_rope", "items_only_alibi"))
+def test_training_runs_selects_on_trained_lengths_and_resumes(prepared_bonus, architecture):
     cfg, tmp_path = prepared_bonus
+    cfg.bonus.architecture = architecture
     run_dir = run_bonus_training(cfg, torch.device("cpu"))
     last = load_checkpoint(run_dir / "checkpoints" / "last.pt")
     assert last["task"] == "bonus_decoder" and last["train_state"]["global_step"] == 4
@@ -84,7 +87,7 @@ def test_training_runs_selects_on_trained_lengths_and_resumes(prepared_bonus):
     assert val_keys == {"val/accuracy_by_length/L01", "val/accuracy_by_length/L02", "val/accuracy_by_length/L03"}  # never 4-5
     assert [r["optimizer_step"] for r in records if "val/loss" in r] == [2, 4]
     summary = json.loads((run_dir / "summary.json").read_text())
-    assert "validation lengths 1-3" in summary["selection_rule"] and summary["architecture"] == "items_only_sinusoidal"
+    assert "validation lengths 1-3" in summary["selection_rule"] and summary["architecture"] == architecture
 
     from engine import config_for_run
 

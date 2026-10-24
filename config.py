@@ -164,7 +164,10 @@ class EvalConfig:
     num_stress_image_sequences: int = 50
 
 
-BonusArchitecture = Literal["items_only_sinusoidal", "items_only_no_positions", "sinusoidal_plus_sum_summary"]
+BonusArchitecture = Literal[
+    "items_only_sinusoidal", "items_only_no_positions", "sinusoidal_plus_sum_summary",
+    "items_only_rope", "items_only_alibi",
+]
 
 
 @dataclass
@@ -335,7 +338,7 @@ def validate(cfg: ExperimentConfig) -> None:
     _require(a.elastic_alpha >= 0.0, "augment.elastic_alpha must be >= 0")
     _require(a.elastic_sigma >= 1.0, "augment.elastic_sigma must be >= 1 (albumentations constraint)")
 
-    _require(m.d_model % m.nhead == 0, "model.d_model must be divisible by model.nhead")
+    _require(m.nhead >= 1 and m.d_model >= 2 and m.d_model % m.nhead == 0, "model.d_model must be >= 2 and divisible by positive model.nhead")
     _require(m.num_layers >= 1, "model.num_layers must be >= 1")
     _require(0.0 <= m.dropout < 1.0, "model.dropout must be in [0, 1)")
 
@@ -358,7 +361,10 @@ def validate(cfg: ExperimentConfig) -> None:
     _require(1 <= b.min_train_length <= b.max_train_length <= b.max_eval_length, "bonus lengths need 1 <= min_train <= max_train <= max_eval")
     _require(b.num_train_sequences >= b.max_train_length - b.min_train_length + 1, "bonus.num_train_sequences must give >= 1 row per training length")
     _require(b.num_eval_per_length >= 1 and b.num_all_image_per_length >= 1, "bonus eval sizes must be >= 1")
-    _require(b.decoder_layers >= 1 and m.d_model % b.decoder_heads == 0, "bonus decoder: >= 1 layer and d_model divisible by decoder_heads")
+    _require(b.decoder_layers >= 1 and b.decoder_heads >= 1 and m.d_model % b.decoder_heads == 0, "bonus decoder: >= 1 layer and d_model divisible by positive decoder_heads")
+    if b.architecture == "items_only_rope":
+        _require((m.d_model // m.nhead) % 2 == 0 and (m.d_model // b.decoder_heads) % 2 == 0,
+                 "RoPE requires even encoder and decoder head dimensions")
     _require(0.0 <= b.decoder_dropout < 1.0, "bonus.decoder_dropout must be in [0, 1)")
     # 9 * max_eval_length can need three digits (e.g. 180), so the cap must allow 3 digits + EOS.
     _require(b.max_new_tokens >= len(str(9 * b.max_eval_length)) + 1, "bonus.max_new_tokens must allow the longest possible answer plus EOS")

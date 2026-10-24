@@ -4,6 +4,8 @@
 #   --set bonus.architecture=items_only_sinusoidal        (primary)
 #   --set bonus.architecture=items_only_no_positions
 #   --set bonus.architecture=sinusoidal_plus_sum_summary  (follow-up ablation)
+#   --set bonus.architecture=items_only_rope               (rotary encoder + decoder self-attention)
+#   --set bonus.architecture=items_only_alibi              (linear distance bias in self-attention)
 name: bonus-local
 
 data:

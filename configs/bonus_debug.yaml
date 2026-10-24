@@ -18,7 +18,7 @@ model:                     # operand encoder (same settings as the main task)
   cnn_batch_norm: true
 
 bonus:
-  architecture: items_only_sinusoidal   # | items_only_no_positions | sinusoidal_plus_sum_summary
+  architecture: items_only_sinusoidal   # also: items_only_no_positions, sinusoidal_plus_sum_summary, items_only_rope, items_only_alibi
   manifest_dir: data/manifests/bonus-debug
   min_train_length: 1
   max_train_length: 10

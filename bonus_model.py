@@ -6,7 +6,7 @@ the whole sequence of encoder outputs through cross-attention:
 
     images [B,L,1,28,28], token_ids [B,L], is_image [B,L], padding_mask [B,L] (True = padding)
       -> OperandEncoder.embed_operands        -> [B,L,D]   one vector per operand (CNN or token embedding)
-      -> + operand positions 0..L-1 (variants with encoder positions; across the whole mixed sequence)
+      -> + sinusoidal operand positions 0..L-1 (additive-position variants only)
       -> OperandEncoder.encode (bidirectional) -> memory [B,L,D]
 
     decoder_input [B,T] (e.g. [BOS, "4", "3"]) -> answer embedding + positions 0..T-1 (0 = BOS)
@@ -15,7 +15,11 @@ the whole sequence of encoder outputs through cross-attention:
            cross-attention to memory (memory_key_padding_mask = padding_mask)
       -> LayerNorm [-> + projected sum summary: ablation only] -> Linear -> logits [B,T,13]
 
-Masks (all Boolean, True = "not allowed / padding", the PyTorch convention):
+RoPE / ALiBi variants instead put positions inside encoder and decoder self-attention, without
+adding sinusoidal vectors. Cross-attention has no positional transform: operands and answer
+characters have separate coordinate systems. All variants use the same teacher-forced loss.
+
+Public masks (Boolean, True = "not allowed / padding", the MultiheadAttention convention):
     src_key_padding_mask    [B,L]  encoder self-attention ignores padded operands
     memory_key_padding_mask [B,L]  decoder cross-attention ignores padded operands
     tgt_mask                [T,T]  causal: True above the diagonal (no peeking at later characters)
@@ -26,9 +30,13 @@ Variants (BonusConfig.architecture):
     items_only_sinusoidal        primary: sinusoidal operand positions + decoder reads encoder items only
     items_only_no_positions      position-free operands (the main-task encoder) + decoder reads items only
     sinusoidal_plus_sum_summary  primary + a masked sum of encoder items added before the vocabulary head
+    items_only_rope              rotary Q/K in encoder and decoder self-attention; values unchanged
+    items_only_alibi             symmetric distance bias in encoder, causal distance bias in decoder
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn.functional as F
@@ -37,8 +45,21 @@ from torch import nn
 from model import OperandEncoder, operand_encoder_kwargs
 from tokenizer import BOS_ID, EOS_ID, OUT_PAD_ID, OUTPUT_VOCAB_SIZE
 
-ARCHITECTURES = ("items_only_sinusoidal", "items_only_no_positions", "sinusoidal_plus_sum_summary")
+ARCHITECTURES = (
+    "items_only_sinusoidal", "items_only_no_positions", "sinusoidal_plus_sum_summary",
+    "items_only_rope", "items_only_alibi",
+)
 DECODER_INPUT_KEYS = ("decoder_input", "decoder_padding_mask")
+
+
+def position_schemes(architecture: str) -> dict[str, str]:
+    """Position metadata shared by the model, checkpoints, and diagnostic scripts."""
+    if architecture not in ARCHITECTURES:
+        raise ValueError(f"architecture must be one of {ARCHITECTURES}, got {architecture!r}")
+    if architecture in ("items_only_rope", "items_only_alibi"):
+        scheme = architecture.removeprefix("items_only_")
+        return {"operands": scheme, "answer": scheme}
+    return {"operands": "none" if architecture == "items_only_no_positions" else "sinusoidal", "answer": "sinusoidal"}
 
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -78,6 +99,113 @@ def causal_mask(length: int, device: torch.device) -> torch.Tensor:
     return torch.triu(torch.ones(length, length, dtype=torch.bool, device=device), diagonal=1)
 
 
+class RotaryPositionEncoding(nn.Module):
+    """RoPE on adjacent feature pairs of Q/K [B,H,L,head_dim], with base 10,000.
+
+    Frequencies use head_dim, not the model width. Positions are computed in float32 at any
+    requested length, then cast to the projection dtype. V is never rotated. No learned table.
+    Reference: https://arxiv.org/abs/2104.09864
+    """
+
+    def __init__(self, head_dim: int):
+        super().__init__()
+        if head_dim < 2 or head_dim % 2:
+            raise ValueError("RoPE needs an even head dimension >= 2")
+        frequency = 10_000.0 ** (-torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        self.register_buffer("inverse_frequency", frequency, persistent=False)
+
+    def forward(self, x: torch.Tensor, offset: int = 0) -> torch.Tensor:
+        positions = torch.arange(offset, offset + x.shape[-2], device=x.device, dtype=torch.float32)
+        angles = positions[:, None] * self.inverse_frequency[None]
+        cosine, sine = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
+        even, odd = x[..., 0::2], x[..., 1::2]
+        return torch.stack((even * cosine - odd * sine, even * sine + odd * cosine), dim=-1).flatten(-2)
+
+
+def alibi_slopes(num_heads: int) -> torch.Tensor:
+    """Fixed ALiBi slopes, including the authors' extension to non-power-of-two head counts.
+
+    Reference: https://github.com/ofirpress/attention_with_linear_biases/issues/5
+    """
+    if num_heads < 1:
+        raise ValueError("ALiBi needs at least one attention head")
+
+    def power_of_two(count):
+        start = 2 ** (-2 ** -(math.log2(count) - 3))
+        return [start ** (i + 1) for i in range(count)]
+
+    closest = 2 ** int(math.log2(num_heads))
+    values = power_of_two(closest)
+    if closest != num_heads:
+        values += power_of_two(2 * closest)[0::2][:num_heads - closest]
+    return torch.tensor(values, dtype=torch.float32)
+
+
+class RelativeSelfAttention(nn.Module):
+    """Parameter-free positional attention using an existing layer's QKV/output projections.
+
+    Keeps the same parameter names, initialization, and count as nn.MultiheadAttention. Uses
+    explicit SDPA so a TransformerEncoderLayer inference fast path cannot bypass RoPE/ALiBi.
+    ALiBi adds -slope[h] * abs(query_position - key_position) AFTER QK scaling; decoder future
+    keys are additionally masked. Padding always means True = excluded at this interface.
+    """
+
+    def __init__(self, scheme: str, head_dim: int, num_heads: int):
+        super().__init__()
+        if scheme not in ("rope", "alibi"):
+            raise ValueError(f"Unknown relative position scheme: {scheme!r}")
+        self.rotary = RotaryPositionEncoding(head_dim) if scheme == "rope" else None
+        self.register_buffer("slopes", alibi_slopes(num_heads) if scheme == "alibi" else None, persistent=False)
+
+    def forward(self, attention: nn.MultiheadAttention, hidden: torch.Tensor,
+                padding_mask: torch.Tensor, causal: bool = False) -> torch.Tensor:
+        batch, length, width = hidden.shape
+        heads, head_dim = attention.num_heads, attention.head_dim
+        projected = F.linear(hidden, attention.in_proj_weight, attention.in_proj_bias)
+        q, k, v = projected.reshape(batch, length, 3, heads, head_dim).permute(2, 0, 3, 1, 4).unbind(0)
+        if self.rotary is not None:
+            q, k = self.rotary(q), self.rotary(k)
+        # SDPA's BOOLEAN mask has the opposite meaning to the public padding mask. Float
+        # 0 / -inf is unambiguous and combines with ALiBi without losing its distance bias.
+        bias = torch.zeros(1, 1, length, length, device=q.device, dtype=q.dtype)
+        if self.slopes is not None:
+            positions = torch.arange(length, device=q.device, dtype=torch.float32)
+            distance = (positions[:, None] - positions[None, :]).abs()
+            bias = (-self.slopes[:, None, None] * distance).to(q.dtype)[None]
+        bias = bias.masked_fill(padding_mask[:, None, None, :], float("-inf"))
+        if causal:
+            bias = bias.masked_fill(causal_mask(length, q.device), float("-inf"))
+        attended = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=bias, dropout_p=attention.dropout if self.training else 0.0,
+        )
+        combined = attended.transpose(1, 2).reshape(batch, length, width)
+        return F.linear(combined, attention.out_proj.weight, attention.out_proj.bias)
+
+
+def relative_encoder_layer(layer, hidden, padding_mask, attention):
+    """The usual encoder residual/FFN blocks, replacing only self-attention; supports pre/post-LN."""
+    def self_attention(x):
+        return layer.dropout1(attention(layer.self_attn, x, padding_mask))
+
+    def feedforward(x):
+        return layer.dropout2(layer.linear2(layer.dropout(layer.activation(layer.linear1(x)))))
+
+    if layer.norm_first:
+        hidden = hidden + self_attention(layer.norm1(hidden))
+        return hidden + feedforward(layer.norm2(hidden))
+    hidden = layer.norm1(hidden + self_attention(hidden))
+    return layer.norm2(hidden + feedforward(hidden))
+
+
+def relative_decoder_layer(layer, hidden, memory, padding_mask, memory_padding_mask, attention):
+    """Pre-LN decoder: relative causal self-attention, ordinary cross-attention, then FFN."""
+    hidden = hidden + layer.dropout1(attention(layer.self_attn, layer.norm1(hidden), padding_mask, causal=True))
+    query = layer.norm2(hidden)
+    cross = layer.multihead_attn(query, memory, memory, key_padding_mask=memory_padding_mask, need_weights=False)[0]
+    hidden = hidden + layer.dropout2(cross)
+    return hidden + layer.dropout3(layer.linear2(layer.dropout(layer.activation(layer.linear1(layer.norm3(hidden))))))
+
+
 class SumAnswerModel(nn.Module):
     """Operand encoder + autoregressive decoder that writes the sum as digit characters."""
 
@@ -92,17 +220,16 @@ class SumAnswerModel(nn.Module):
         summary_scale: float = 0.1,
     ):
         super().__init__()
-        if architecture not in ARCHITECTURES:
-            raise ValueError(f"architecture must be one of {ARCHITECTURES}, got {architecture!r}")
+        schemes = position_schemes(architecture)
         d_model = encoder_kwargs["d_model"]
         self.architecture = architecture
-        self.use_operand_positions = architecture != "items_only_no_positions"
+        self.use_operand_positions = schemes["operands"] == "sinusoidal"  # additive vectors only
         self.summary_scale = summary_scale
 
         self.operands = OperandEncoder(**encoder_kwargs)  # CNN + token/modality embeddings + bidirectional encoder
-        # One parameter-free module serves two *separate* position sequences: operands (0..L-1)
-        # and answer characters (0 = BOS, 1, 2, ...).
-        self.positions = SinusoidalPositionalEncoding(d_model)
+        # The original variants share an additive encoding for two separate position sequences.
+        # Relative variants have no additive encoding on either side.
+        self.positions = SinusoidalPositionalEncoding(d_model) if schemes["answer"] == "sinusoidal" else None
         self.answer_embedding = nn.Embedding(OUTPUT_VOCAB_SIZE, d_model, padding_idx=OUT_PAD_ID)
         # Independently constructed layers (each gets its own random init), as in the encoder.
         self.decoder_layers = nn.ModuleList(
@@ -124,6 +251,13 @@ class SumAnswerModel(nn.Module):
         # Ablation only. It is built last, so under the same seed every shared parameter is
         # initialized exactly as in the other variants.
         self.summary_projection = nn.Linear(d_model, d_model) if architecture == "sinusoidal_plus_sum_summary" else None
+        # Added after all learned modules; no random draws or persistent buffers, so old
+        # checkpoint keys and seeded parameter initialization remain exactly the same.
+        self.encoder_attention = self.decoder_attention = None
+        if schemes["operands"] in ("rope", "alibi"):
+            heads = self.operands.layers[0].self_attn.num_heads
+            self.encoder_attention = RelativeSelfAttention(schemes["operands"], d_model // heads, heads)
+            self.decoder_attention = RelativeSelfAttention(schemes["answer"], d_model // decoder_heads, decoder_heads)
 
     # ------------------------------------------------------------------ encoder side
 
@@ -134,10 +268,15 @@ class SumAnswerModel(nn.Module):
         sequence, whether that slot holds an image or text. Batches are right-padded, so real
         operands always sit at positions 0..len-1, and padded slots (which also get a position
         vector) stay masked. The encoder is bidirectional: there is no causal mask here.
+        Relative variants instead transform self-attention Q/K or scores at each layer.
         """
         features = self.operands.embed_operands(images, token_ids, is_image, padding_mask)  # [B, L, D]
         if self.use_operand_positions:
             features = features + self.positions(features.shape[1], features.device, features.dtype)[None]  # [1, L, D]
+        if self.encoder_attention is not None:
+            for layer in self.operands.layers:
+                features = relative_encoder_layer(layer, features, padding_mask, self.encoder_attention)
+            return self.operands.final_norm(features)
         return self.operands.encode(features, padding_mask)  # [B, L, D]
 
     def sum_summary(self, memory: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
@@ -158,14 +297,21 @@ class SumAnswerModel(nn.Module):
 
         Logits at position t predict the token at position t+1 of [BOS, d1, d2, ..., EOS]. The same
         positions (0 = BOS) are used in teacher forcing and in free generation.
+        Relative variants replace additive answer positions with causal RoPE/ALiBi attention.
         """
         length = decoder_input.shape[1]
         hidden = self.answer_embedding(decoder_input)  # [B, T, D]
-        hidden = hidden + self.positions(length, hidden.device, hidden.dtype)[None]  # [1, T, D]
+        if self.decoder_attention is None:
+            hidden = hidden + self.positions(length, hidden.device, hidden.dtype)[None]  # [1, T, D]
         if decoder_padding_mask is None:
             decoder_padding_mask = torch.zeros_like(decoder_input, dtype=torch.bool)
         future = causal_mask(length, hidden.device)  # [T, T]
         for layer in self.decoder_layers:
+            if self.decoder_attention is not None:
+                hidden = relative_decoder_layer(
+                    layer, hidden, memory, decoder_padding_mask, memory_padding_mask, self.decoder_attention,
+                )
+                continue
             hidden = layer(
                 hidden,
                 memory,

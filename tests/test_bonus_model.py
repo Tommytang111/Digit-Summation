@@ -84,8 +84,9 @@ def test_operand_padding_with_garbage_changes_nothing(architecture):
     assert torch.allclose(plain, padded, atol=1e-6)
 
 
-def test_decoder_padding_positions_do_not_affect_valid_positions():
-    model = make().eval()
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_decoder_padding_positions_do_not_affect_valid_positions(architecture):
+    model = make(architecture).eval()
     inputs = text_batch([[7]], CPU)
     short = torch.tensor([[BOS_ID, OUTPUT_VOCAB["7"]]])
     padded = torch.tensor([[BOS_ID, OUTPUT_VOCAB["7"], OUTPUT_VOCAB["9"]]])  # junk in a padded position
@@ -139,6 +140,11 @@ def test_variant_parameter_counts_and_shared_initialization():
     assert counts["sinusoidal_plus_sum_summary"] - counts["items_only_sinusoidal"] == 128 * 128 + 128
     base, ablation = make("items_only_sinusoidal").state_dict(), make("sinusoidal_plus_sum_summary").state_dict()
     assert all(torch.equal(base[k], ablation[k]) for k in base)  # summary layer is built last
+    for architecture in ("items_only_rope", "items_only_alibi"):
+        relative = make(architecture).state_dict()
+        assert counts[architecture] == counts["items_only_sinusoidal"]
+        assert relative.keys() == base.keys()
+        assert all(torch.equal(base[k], relative[k]) for k in base)
 
 
 # ----------------------------------------------------------------------------- generation
@@ -188,9 +194,10 @@ def next_token(model, rows, prefix=(BOS_ID,)):
     return model(**inputs, decoder_input=torch.tensor([list(prefix)] * len(rows)))[:, -1].softmax(-1)
 
 
-def test_position_free_model_is_count_blind_for_identical_operands():
+@pytest.mark.parametrize("architecture", ("items_only_no_positions", "items_only_rope", "items_only_alibi"))
+def test_position_free_model_is_count_blind_for_identical_operands(architecture):
     """Softmax attention averages identical items, so [3], [3,3], ..., [3]*20 are indistinguishable."""
-    model = make("items_only_no_positions").eval()
+    model = make(architecture).eval()
     reference = next_token(model, [[3]])
     for k in (2, 3, 10, 20):
         assert torch.allclose(next_token(model, [[3] * k]), reference, atol=1e-5)

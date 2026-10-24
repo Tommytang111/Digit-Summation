@@ -35,7 +35,7 @@ import torch.nn.functional as F
 import visualization as viz
 from augmentations import build_transform, derive_seed
 from bonus_data import MultiLengthDataset, bonus_collate, eval_lengths, manifest_name, train_lengths
-from bonus_model import bonus_model_inputs, build_bonus_model, teacher_forced_loss
+from bonus_model import bonus_model_inputs, build_bonus_model, position_schemes, teacher_forced_loss
 from config import ExperimentConfig, config_from_dict, config_to_dict
 from dataset import PreparedData, load_manifests, load_mnist_arrays, load_source_pools
 from engine import (
@@ -212,7 +212,7 @@ def checkpoint_extra(cfg) -> dict:
         "task": TASK,
         "output_vocab": dict(OUTPUT_VOCAB),
         "architecture": cfg.bonus.architecture,
-        "positions": {"operands": "none" if cfg.bonus.architecture == "items_only_no_positions" else "sinusoidal", "answer": "sinusoidal"},
+        "positions": position_schemes(cfg.bonus.architecture),
         "selection_rule": selection_rule(cfg),
     }
 
